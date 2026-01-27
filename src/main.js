@@ -515,6 +515,30 @@ function updateShuttleCount(count) {
 }
 
 /**
+ * Initialize refresh button
+ */
+function initRefreshButton() {
+  const refreshBtn = document.getElementById('refresh-btn');
+  if (!refreshBtn) return;
+  
+  refreshBtn.addEventListener('click', async () => {
+    // Add spinning animation
+    refreshBtn.classList.add('spinning');
+    refreshBtn.disabled = true;
+    
+    try {
+      await updateData();
+    } finally {
+      // Remove spinning after a minimum time for visual feedback
+      setTimeout(() => {
+        refreshBtn.classList.remove('spinning');
+        refreshBtn.disabled = false;
+      }, 500);
+    }
+  });
+}
+
+/**
  * Initialize the application
  */
 async function init() {
@@ -525,6 +549,9 @@ async function init() {
   
   // Initialize mobile bottom sheet
   initMobileSheet();
+  
+  // Initialize refresh button
+  initRefreshButton();
   
   try {
     // Fetch initial data
