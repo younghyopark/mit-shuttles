@@ -348,6 +348,9 @@ function updateVehicleMarkers(vehicles) {
 function renderShuttleList(vehicles) {
   const container = document.getElementById('shuttle-list');
   
+  // Update shuttle count in handle
+  updateShuttleCount(vehicles.length);
+  
   if (vehicles.length === 0) {
     container.innerHTML = '<p class="loading">No active shuttles</p>';
     return;
@@ -470,6 +473,48 @@ async function updateData() {
 }
 
 /**
+ * Initialize mobile bottom sheet behavior
+ */
+function initMobileSheet() {
+  const sidebar = document.getElementById('sidebar');
+  const handle = document.getElementById('sidebar-handle');
+  
+  if (!sidebar || !handle) return;
+  
+  // Check if mobile
+  const isMobile = () => window.innerWidth <= 768;
+  
+  // Start collapsed on mobile
+  if (isMobile()) {
+    sidebar.classList.add('collapsed');
+  }
+  
+  // Toggle on handle click
+  handle.addEventListener('click', () => {
+    if (isMobile()) {
+      sidebar.classList.toggle('collapsed');
+    }
+  });
+  
+  // Handle window resize
+  window.addEventListener('resize', () => {
+    if (!isMobile()) {
+      sidebar.classList.remove('collapsed');
+    }
+  });
+}
+
+/**
+ * Update shuttle count label
+ */
+function updateShuttleCount(count) {
+  const label = document.getElementById('shuttle-count');
+  if (label) {
+    label.textContent = count === 1 ? '1 Active Shuttle' : `${count} Active Shuttles`;
+  }
+}
+
+/**
  * Initialize the application
  */
 async function init() {
@@ -477,6 +522,9 @@ async function init() {
   
   // Initialize map
   initMap();
+  
+  // Initialize mobile bottom sheet
+  initMobileSheet();
   
   try {
     // Fetch initial data
