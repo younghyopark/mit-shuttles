@@ -473,7 +473,7 @@ async function updateData() {
 }
 
 /**
- * Initialize mobile bottom sheet behavior
+ * Initialize mobile bottom sheet behavior with drag support
  */
 function initMobileSheet() {
   const sidebar = document.getElementById('sidebar');
@@ -489,9 +489,68 @@ function initMobileSheet() {
     sidebar.classList.add('collapsed');
   }
   
-  // Toggle on handle click
-  handle.addEventListener('click', () => {
-    if (isMobile()) {
+  // Drag state
+  let isDragging = false;
+  let startY = 0;
+  let startTranslate = 0;
+  let currentTranslate = 0;
+  
+  // Get the collapsed translate value
+  const getCollapsedTranslate = () => {
+    const sidebarHeight = sidebar.offsetHeight;
+    const handleHeight = 70; // Handle visible height when collapsed
+    return sidebarHeight - handleHeight;
+  };
+  
+  // Touch start
+  handle.addEventListener('touchstart', (e) => {
+    if (!isMobile()) return;
+    
+    isDragging = true;
+    startY = e.touches[0].clientY;
+    
+    // Get current translate value
+    const isCollapsed = sidebar.classList.contains('collapsed');
+    startTranslate = isCollapsed ? getCollapsedTranslate() : 0;
+    currentTranslate = startTranslate;
+    
+    // Disable transition during drag
+    sidebar.style.transition = 'none';
+    sidebar.classList.remove('collapsed');
+  }, { passive: true });
+  
+  // Touch move
+  handle.addEventListener('touchmove', (e) => {
+    if (!isDragging) return;
+    
+    const deltaY = e.touches[0].clientY - startY;
+    currentTranslate = Math.max(0, Math.min(getCollapsedTranslate(), startTranslate + deltaY));
+    
+    sidebar.style.transform = `translateY(${currentTranslate}px)`;
+  }, { passive: true });
+  
+  // Touch end
+  handle.addEventListener('touchend', () => {
+    if (!isDragging) return;
+    isDragging = false;
+    
+    // Re-enable transition
+    sidebar.style.transition = '';
+    sidebar.style.transform = '';
+    
+    // Snap to expanded or collapsed based on position
+    const threshold = getCollapsedTranslate() * 0.4;
+    if (currentTranslate > threshold) {
+      sidebar.classList.add('collapsed');
+    } else {
+      sidebar.classList.remove('collapsed');
+    }
+  });
+  
+  // Also support click for accessibility
+  handle.addEventListener('click', (e) => {
+    // Only toggle on click if it wasn't a drag
+    if (!isDragging && isMobile()) {
       sidebar.classList.toggle('collapsed');
     }
   });
@@ -500,6 +559,7 @@ function initMobileSheet() {
   window.addEventListener('resize', () => {
     if (!isMobile()) {
       sidebar.classList.remove('collapsed');
+      sidebar.style.transform = '';
     }
   });
 }

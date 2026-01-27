@@ -499,15 +499,24 @@ body {
     cursor: grab;
     user-select: none;
     -webkit-user-select: none;
-    touch-action: none;
+    touch-action: pan-y;
+  }
+  
+  .sidebar-handle:active {
+    cursor: grabbing;
   }
   
   .handle-bar {
-    width: 36px;
-    height: 4px;
-    background: rgba(255, 255, 255, 0.3);
-    border-radius: 2px;
+    width: 40px;
+    height: 5px;
+    background: rgba(255, 255, 255, 0.4);
+    border-radius: 3px;
     margin-bottom: 0.5rem;
+    transition: background 0.2s;
+  }
+  
+  .sidebar-handle:active .handle-bar {
+    background: rgba(255, 255, 255, 0.6);
   }
   
   .handle-label {
