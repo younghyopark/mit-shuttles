@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+.conda/
+
+# Build output
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug/test files
+*.pyc
+__pycache__/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+mit-shuttle/
