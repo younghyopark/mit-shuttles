@@ -6,6 +6,8 @@ import L from 'leaflet';
 import {
   fetchAllRoutesAndData,
   fetchAllVehicles,
+  fetchStopETAs,
+  fetchRoutePositions,
   SYSTEMS,
 } from './api.js';
 
@@ -44,10 +46,41 @@ const state = {
   routeLines: new Map(),      // Route polylines
   stopMarkers: new Map(),     // Stop markers grouped by route
   routeData: null,            // Route points and stops data
+  // Precomputed per-route geometry used for route-aware bus progress. Without
+  // this, a bus physically near a stop on an out-and-back segment reads as
+  // "at that stop" even when it's still outbound — because the old fallback
+  // matched straight-line segments between stops instead of the real polyline.
+  // Populated once after routeData loads; never mutated at poll time.
+  polyMeta: new Map(),        // routeId -> { poly, cumDist, totalLen }
+  stopPolyIdx: new Map(),     // routeId -> [fractional polyline index, ...] in service order
+  // Per-bus forward-continuity hint for projectBusOntoPolyline. Prevents the
+  // projector from jumping between lollipop-segment candidates between polls.
+  lastBusPolyIdx: new Map(),  // `${routeId}:${busId}` -> { polyIdx, time }
+  // Authoritative per-bus stop positions from Passio's rich ETA shape.
+  // Populated by refreshPinnedRoutePositions() before each render. When
+  // present, this short-circuits all GPS projection logic in
+  // computeBusFractionalIndex — we trust Passio's "bus is approaching
+  // stop N" answer directly instead of guessing it from lat/lng. Keyed
+  // by prefixed routeId at the outer level, bus fleet number inside.
+  busRoutePositions: new Map(),  // routeId -> Map<busName, positionRecord>
+  busRoutePositionsFetchedAtMs: 0,
   pinnedStop: null,           // Single { routeId, stopId } or null
   displayPrefs: { showNextStop: true }, // User display preferences (persisted)
   lastBusFrac: new Map(),     // `${routeId}:${busId}` -> { frac, time } for smoothing
-  updateTimer: null
+  // ETAs for the currently pinned stop. Repopulated on every updateData cycle
+  // when a stop is pinned, and cleared when the pin changes. Callers look up
+  // ETAs by bus fleet number via `byBusName` because that's the only field
+  // Passio's ETA endpoint guarantees across both of its response shapes.
+  pinnedEtas: {
+    routeId: null,            // prefixed, matches state.pinnedStop.routeId
+    stopId:  null,
+    fetchedAtMs: 0,
+    byBusName: new Map(),     // bus fleet number -> ETA record
+    list: [],                 // sorted-soonest-first array, for overflow rendering
+  },
+  updateTimer: null,
+  etaTickTimer: null,         // 1s tick that advances ETA countdowns in place
+  pinnedEtasInFlight: 0,      // monotonic token to discard stale ETA responses
 };
 
 /**
@@ -215,6 +248,24 @@ function isStopPinned(routeId, stopId) {
  */
 function pinStop(routeId, stopId) {
   state.pinnedStop = { routeId, stopId };
+  // Discard ETAs from the previous pin so the panel doesn't flash stale
+  // minutes from the old stop. Bumping the in-flight token also orphans
+  // any mid-flight fetch from the previous pin.
+  state.pinnedEtasInFlight++;
+  state.pinnedEtas.routeId = null;
+  state.pinnedEtas.stopId  = null;
+  state.pinnedEtas.byBusName.clear();
+  state.pinnedEtas.list = [];
+  state.pinnedEtas.fetchedAtMs = 0;
+  // Also clear stale server-position data from the previous pin's route
+  // so the panel doesn't briefly show the old route's bus positions
+  // against the new route's stop list.
+  state.busRoutePositions = new Map();
+  state.busRoutePositionsFetchedAtMs = 0;
+  // Kick off immediate fetches for the new pin so the user doesn't wait
+  // up to 5s for the next poll. Both are fire-and-forget; neither throws.
+  refreshPinnedEtas({ renderOnSuccess: true });
+  refreshPinnedRoutePositions().then(renderPinnedPanel);
   savePinnedStop();
   renderPinnedPanel();
 }
@@ -226,6 +277,17 @@ function pinStop(routeId, stopId) {
 function unpinStop() {
   if (state.pinnedStop === null) return;
   state.pinnedStop = null;
+  // Clear ETA state and orphan any in-flight fetch.
+  state.pinnedEtasInFlight++;
+  state.pinnedEtas.routeId = null;
+  state.pinnedEtas.stopId  = null;
+  state.pinnedEtas.byBusName.clear();
+  state.pinnedEtas.list = [];
+  state.pinnedEtas.fetchedAtMs = 0;
+  // And clear server-position data so downstream consumers (stop
+  // popups for the old route) fall back to polyline projection.
+  state.busRoutePositions = new Map();
+  state.busRoutePositionsFetchedAtMs = 0;
   savePinnedStop();
   renderPinnedPanel();
 }
@@ -410,19 +472,457 @@ function distMetersToSegment(p, a, b) {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
+// ---------------------------------------------------------------------------
+// Route-aware bus progress: project buses onto the route POLYLINE, not onto
+// straight lines between consecutive stops.
+//
+// Why this exists: Tech Shuttle (and others) have "lollipop" segments where
+// the bus physically drives past a stop, continues to a turnaround, and
+// comes back through the same street — only stopping on the return leg.
+// A GPS-nearest-stop match reports the bus as "at" that stop on both the
+// outbound and inbound pass, which made the approach-line panel flicker
+// back-and-forth around Grad Junction West, W92, etc.
+//
+// The polyline already encodes the out-and-back geometry as two distinct
+// sequences of vertices at the same GPS coordinates. If we project each
+// bus onto the polyline with a forward-monotonic search (hint-based after
+// the first poll; heading-based on bootstrap), the outbound pass gets
+// mapped to a far smaller polyline index than the inbound pass, and the
+// stops-away math Just Works.
+// ---------------------------------------------------------------------------
+
+/**
+ * Precompute per-route geometry used by the polyline-based progress logic:
+ *
+ *   state.polyMeta.get(routeId)      = { poly, cumDist, totalLen }
+ *   state.stopPolyIdx.get(routeId)   = [fracPolyIdx_0, ..., fracPolyIdx_{M-1}]
+ *
+ * `poly` is an array of [lat, lng] pairs (copy of routeData.routePoints).
+ * `cumDist[i]` is the cumulative ground distance in meters from poly[0] to
+ * poly[i] — used to convert polyline-vertex indices into a "fraction of
+ * route traveled" value if we ever need one.
+ *
+ * The per-stop polyline indices are assigned GREEDILY in service order:
+ * stop i must project to a polyline index strictly greater than stop i-1.
+ * This is what resolves lollipop stops — given a choice between two GPS
+ * matches, pick the one that comes later in the polyline than the previous
+ * stop. For loop routes, the final stop wraps back to near the starting
+ * polyline point; no special handling needed because `stopPolyIdxExt`
+ * (used in polyIdxToStopFracIdx) synthesizes a wraparound sentinel.
+ *
+ * Stops whose GPS projection to the forward window exceeds 120m (the stop
+ * is probably a data bug, or the polyline is broken) fall back to a global
+ * closest-point projection, with a console warning. That's lossy for the
+ * loop-back case but never crashes.
+ */
+function precomputeRouteGeometry(routeId) {
+  const poly = state.routeData?.routePoints?.[routeId];
+  const stops = state.routeData?.stops?.[routeId];
+  if (!Array.isArray(poly) || poly.length < 2) return;
+  if (!Array.isArray(stops) || stops.length === 0) return;
+
+  // Cumulative distance along the polyline, so any caller that wants to
+  // speak in meters (not vertex indices) can convert cheaply later.
+  const cumDist = new Float64Array(poly.length);
+  cumDist[0] = 0;
+  for (let i = 1; i < poly.length; i++) {
+    const [lat0, lng0] = poly[i - 1];
+    const [lat1, lng1] = poly[i];
+    const dLat = (lat1 - lat0) * LAT_TO_M;
+    const dLng = (lng1 - lng0) * LAT_TO_M * LAT_COS;
+    cumDist[i] = cumDist[i - 1] + Math.sqrt(dLat * dLat + dLng * dLng);
+  }
+
+  state.polyMeta.set(routeId, { poly, cumDist, totalLen: cumDist[poly.length - 1] });
+
+  // Greedy monotonic assignment of stops to polyline indices. For each stop,
+  // walk segments starting from `startAt` (one past the previous stop's
+  // assignment) and record the closest-projection segment. The chosen
+  // fractional index is (segIdx + t) where t ∈ [0, 1] is the projection
+  // along that segment.
+  const M = stops.length;
+  const stopIdx = new Float64Array(M);
+  let startAt = 0;
+  for (let s = 0; s < M; s++) {
+    const stop = stops[s];
+    if (!Number.isFinite(stop.latitude) || !Number.isFinite(stop.longitude)) {
+      stopIdx[s] = s === 0 ? 0 : stopIdx[s - 1] + 0.5;
+      continue;
+    }
+
+    // How far ahead may we look? The last stop has to sit before the end
+    // of the polyline, so we cap at `poly.length - 1`. Every other stop
+    // can scan to the end of the polyline unless the stop chase falls off,
+    // which we handle with a global-fallback below.
+    let bestSeg = -1;
+    let bestT = 0;
+    let bestDist = Infinity;
+    for (let i = startAt; i < poly.length - 1; i++) {
+      const a = poly[i];
+      const b = poly[i + 1];
+      const { t, dist } = projectPointOntoSegment(
+        stop.latitude, stop.longitude, a[0], a[1], b[0], b[1]
+      );
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestSeg = i;
+        bestT = t;
+      }
+    }
+
+    // If the forward window didn't find a reasonable match (>120m off any
+    // forward segment), the stop must lie on a segment we already passed
+    // in the greedy walk — which only happens for data bugs. Fall back to
+    // a global search so we at least have SOME index for this stop.
+    if (bestDist > 120 || bestSeg === -1) {
+      let gSeg = -1;
+      let gT = 0;
+      let gDist = Infinity;
+      for (let i = 0; i < poly.length - 1; i++) {
+        const a = poly[i];
+        const b = poly[i + 1];
+        const { t, dist } = projectPointOntoSegment(
+          stop.latitude, stop.longitude, a[0], a[1], b[0], b[1]
+        );
+        if (dist < gDist) {
+          gDist = dist;
+          gSeg = i;
+          gT = t;
+        }
+      }
+      if (gSeg !== -1) {
+        bestSeg = gSeg;
+        bestT = gT;
+        bestDist = gDist;
+      }
+      console.warn(
+        `[route geometry] stop "${stop.name}" on ${routeId} fell back to ` +
+        `global projection (dist=${Math.round(bestDist)}m). This is usually ` +
+        `fine for a stop on the return leg of a loop.`
+      );
+    }
+
+    const frac = bestSeg + bestT;
+    stopIdx[s] = frac;
+    // Advance the window slightly past the chosen segment so the NEXT stop
+    // is forced further along the polyline. +1 is safe because a stop whose
+    // real polyline vertex is within [bestSeg, bestSeg+1] has t<1, so the
+    // next stop's bestSeg will be ≥ bestSeg+1 regardless.
+    startAt = Math.min(poly.length - 2, bestSeg + 1);
+  }
+
+  state.stopPolyIdx.set(routeId, stopIdx);
+}
+
+/**
+ * Project a point onto a line segment defined by two lat/lng pairs.
+ * Returns `{ t, dist }` where t ∈ [0, 1] is the clamped fractional position
+ * along the segment and dist is the Euclidean distance in meters from the
+ * point to its projection.
+ *
+ * Uses the same flat-earth cosine correction as distMetersToSegment, kept
+ * in a self-contained form here so precomputeRouteGeometry doesn't allocate
+ * intermediate stop-objects to call distMetersToSegment.
+ */
+function projectPointOntoSegment(pLat, pLng, aLat, aLng, bLat, bLng) {
+  const pax = (pLng - aLng) * LAT_TO_M * LAT_COS;
+  const pay = (pLat - aLat) * LAT_TO_M;
+  const bax = (bLng - aLng) * LAT_TO_M * LAT_COS;
+  const bay = (bLat - aLat) * LAT_TO_M;
+  const lenSq = bax * bax + bay * bay;
+  if (lenSq === 0) {
+    return { t: 0, dist: Math.sqrt(pax * pax + pay * pay) };
+  }
+  let t = (pax * bax + pay * bay) / lenSq;
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  const dx = pax - t * bax;
+  const dy = pay - t * bay;
+  return { t, dist: Math.sqrt(dx * dx + dy * dy) };
+}
+
+/**
+ * Project a bus onto the route polyline, returning a fractional polyline
+ * vertex index. Forward-continuity is enforced: on subsequent polls we
+ * restrict the search to a window around the previous projection, so
+ * lollipop segments (same GPS, different polyline index) don't flip.
+ *
+ * Bootstrap (no previous projection, or the previous one is older than
+ * 60s) picks between globally-closest candidates using the bus heading:
+ * the candidate whose local polyline direction best aligns with the
+ * bus's `calculatedCourse` wins. This is cheap and self-correcting —
+ * even a bad bootstrap gets replaced on the next poll by a forward-window
+ * search anchored on the new position.
+ *
+ * Returns null if the bus has no GPS or the route has no polyMeta.
+ */
+function projectBusOntoPolyline(bus, routeId) {
+  const meta = state.polyMeta.get(routeId);
+  if (!meta) return null;
+  if (typeof bus.latitude !== 'number' || typeof bus.longitude !== 'number') return null;
+  const poly = meta.poly;
+  const N = poly.length;
+  if (N < 2) return null;
+
+  const cacheKey = `${routeId}:${bus.id}`;
+  const prev = state.lastBusPolyIdx.get(cacheKey);
+  const now = Date.now();
+  const havePrev = prev && (now - prev.time) < 60000;
+
+  // Window search: scan a short forward window around the previous index
+  // so a bus that's made small forward progress can't suddenly project
+  // backward to a lollipop twin on the outbound leg.
+  let bestIdx = -1;
+  let bestT = 0;
+  let bestDist = Infinity;
+
+  if (havePrev) {
+    const WINDOW_BACK = 5;   // tiny backward slack for GPS noise at stops
+    const WINDOW_FWD  = 80;  // max forward advance per 5s poll (very loose)
+    const center = Math.floor(prev.polyIdx);
+    const startI = Math.max(0, center - WINDOW_BACK);
+    const endI   = Math.min(N - 2, center + WINDOW_FWD);
+    for (let i = startI; i <= endI; i++) {
+      const a = poly[i];
+      const b = poly[i + 1];
+      const { t, dist } = projectPointOntoSegment(
+        bus.latitude, bus.longitude, a[0], a[1], b[0], b[1]
+      );
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+        bestT = t;
+      }
+    }
+
+    // If the window search turned up a genuinely distant projection, the
+    // bus may have looped past the end of the window (wrap around to idx 0)
+    // or taken a detour. Fall back to a global search in that case.
+    if (bestDist > 200) {
+      const g = projectBusGlobal(bus, meta, null);
+      if (g) return g;
+    }
+  } else {
+    // Bootstrap: use heading to pick between GPS-equivalent candidates.
+    const g = projectBusGlobal(bus, meta, bus.heading);
+    if (g == null) return null;
+    bestIdx = Math.floor(g);
+    bestT   = g - bestIdx;
+    bestDist = 0; // not used after this point; we accept the pick
+  }
+
+  if (bestIdx < 0) return null;
+  const frac = bestIdx + bestT;
+  state.lastBusPolyIdx.set(cacheKey, { polyIdx: frac, time: now });
+  return frac;
+}
+
+/**
+ * Bootstrap / fallback global search. Walks every polyline segment and
+ * returns the single fractional index that best matches the bus position.
+ * When `heading` is a finite number (bus's `calculatedCourse`), ties
+ * between lollipop twins are broken by picking the candidate whose local
+ * segment direction best aligns with the bus's heading — a 2D dot product
+ * between the unit vector of the segment and the unit vector of the bus's
+ * travel direction.
+ */
+function projectBusGlobal(bus, meta, heading) {
+  const poly = meta.poly;
+  const N = poly.length;
+  if (N < 2) return null;
+
+  // First, collect every segment whose projection distance is within a
+  // small margin of the global minimum. Those are the lollipop twins.
+  let absoluteMinDist = Infinity;
+  const perSeg = new Array(N - 1);
+  for (let i = 0; i < N - 1; i++) {
+    const a = poly[i];
+    const b = poly[i + 1];
+    const { t, dist } = projectPointOntoSegment(
+      bus.latitude, bus.longitude, a[0], a[1], b[0], b[1]
+    );
+    perSeg[i] = { t, dist, i };
+    if (dist < absoluteMinDist) absoluteMinDist = dist;
+  }
+  if (!Number.isFinite(absoluteMinDist)) return null;
+
+  // "Candidate" = any segment within 25m of the absolute best. Lollipop
+  // twins will be almost-equal, unrelated segments will be much worse.
+  const candidateThresh = absoluteMinDist + 25;
+  const candidates = perSeg.filter(s => s.dist <= candidateThresh);
+  if (candidates.length === 0) return null;
+
+  // Only one candidate? Return it directly; no heading tiebreak needed.
+  if (candidates.length === 1 || !Number.isFinite(heading)) {
+    const best = candidates.reduce((a, b) => (a.dist <= b.dist ? a : b));
+    return best.i + best.t;
+  }
+
+  // Heading tiebreak. Bus heading is in degrees clockwise from north (0 = N,
+  // 90 = E, 180 = S, 270 = W). Convert to a unit vector in the same "local
+  // meters" frame we use for segment directions: (east, north).
+  const hRad = heading * Math.PI / 180;
+  const hEast = Math.sin(hRad);
+  const hNorth = Math.cos(hRad);
+
+  let best = candidates[0];
+  let bestScore = -Infinity;
+  for (const c of candidates) {
+    const a = poly[c.i];
+    const b = poly[c.i + 1];
+    const segEast  = (b[1] - a[1]) * LAT_COS;
+    const segNorth = (b[0] - a[0]);
+    const segLen = Math.sqrt(segEast * segEast + segNorth * segNorth);
+    if (segLen === 0) continue;
+    const align = (segEast / segLen) * hEast + (segNorth / segLen) * hNorth;
+    // Penalize by GPS distance so a perfectly-aligned but 50m-off segment
+    // doesn't beat a 2m-off misaligned one.
+    const score = align - (c.dist / 50);
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best.i + best.t;
+}
+
+/**
+ * Convert a fractional polyline index to a fractional STOP index in the
+ * route's service sequence. Handles loop wrap: the stop sequence is
+ * cyclic, so a bus between the last stop and the first stop (polyline
+ * tail → polyline head) reports a frac of (M - 1 + progress) modulo M.
+ *
+ * Returns null if the route has no precomputed stopPolyIdx.
+ */
+function polyIdxToStopFracIdx(polyIdx, routeId) {
+  const idx = state.stopPolyIdx.get(routeId);
+  const meta = state.polyMeta.get(routeId);
+  if (!idx || !meta) return null;
+  const M = idx.length;
+  if (M === 0) return null;
+  const polyLen = meta.poly.length - 1; // max segment index + 1
+
+  // Build the extended array so the last-stop-to-first-stop wrap is just
+  // another interpolation cell. stopPolyIdxExt[M] = stopPolyIdx[0] + polyLen
+  // (the "next" visit of the first stop, after one full loop).
+  const ext = new Array(M + 1);
+  for (let i = 0; i < M; i++) ext[i] = idx[i];
+  ext[M] = idx[0] + polyLen;
+
+  // Normalize the polyline index into the extended range. If the bus is
+  // before the first stop's polyline index, shift it forward by polyLen
+  // so it lands in the wraparound cell [ext[M-1], ext[M]].
+  let p = polyIdx;
+  if (p < ext[0]) p += polyLen;
+
+  // Linear scan is fine: M is <= 20ish for MIT routes. Binary search would
+  // be two lines shorter and save nothing measurable.
+  for (let k = 0; k < M; k++) {
+    const lo = ext[k];
+    const hi = ext[k + 1];
+    if (p >= lo && p <= hi) {
+      const span = hi - lo;
+      const frac = span > 0 ? k + (p - lo) / span : k;
+      return frac % M;
+    }
+  }
+  // Shouldn't reach here if ext is monotonic, but guard anyway.
+  return null;
+}
+
+/**
+ * Convert one of Passio's authoritative bus position records (from the
+ * rich ETA shape) into a fractional stop index for the pinned-panel
+ * visualization.
+ *
+ * The record gives us:
+ *   - `routeStopPosition`: integer index of the NEXT stop the bus is
+ *                           approaching (or its current dwell stop).
+ *   - `routePointPosition`: the bus's polyline vertex index, or null
+ *                           when Passio reports -1 (meaning "at stop").
+ *
+ * When the bus is in transit we interpolate fractional progress using
+ * the precomputed `stopPolyIdx`: the polyline distance between the
+ * previous and next stops gives us a span, and the bus's offset from
+ * the previous stop within that span gives us `t ∈ [0, 1]`. Result:
+ *
+ *     frac = (prevStopIdx + t) mod M
+ *
+ * When Passio has no valid polyline position (dwelling at a stop, or
+ * geometry missing), we snap to the integer next-stop index so the
+ * panel still shows a correct "at stop" state.
+ *
+ * Loop wrap is handled by shifting the next stop's polyline index by
+ * polyLen when it's less than the previous stop's — same trick
+ * polyIdxToStopFracIdx uses for the extended sentinel cell.
+ */
+function fracIdxFromServerPosition(pos, routeId, M) {
+  const nextStop = pos.routeStopPosition;
+  if (!Number.isFinite(nextStop) || nextStop < 0 || nextStop >= M) return null;
+
+  // No in-transit polyline position — bus is either dwelling at a stop
+  // or Passio doesn't have a fresh projection. Snap to the integer
+  // next-stop index; the geofence logic in computeBusFractionalIndex
+  // will then collapse this to exactly "at stop" in the UI.
+  if (pos.routePointPosition == null) {
+    return nextStop;
+  }
+
+  const stopPolyIdx = state.stopPolyIdx.get(routeId);
+  const polyMeta = state.polyMeta.get(routeId);
+  if (!stopPolyIdx || stopPolyIdx.length === 0 || !polyMeta) {
+    return nextStop;
+  }
+
+  // Previous stop = one before the next stop (with loop wrap).
+  const prevStop = (nextStop - 1 + M) % M;
+  const prevPoly = stopPolyIdx[prevStop];
+  let nextPoly   = stopPolyIdx[nextStop];
+  const polyLen  = polyMeta.poly.length - 1;
+
+  // Loop-boundary case: the bus is between the last service stop and
+  // the first one (returning to origin for a new loop). In polyline
+  // terms the "next" stop wraps to the beginning, so we synthesize a
+  // nextPoly in extended coordinates.
+  let busPoly = pos.routePointPosition;
+  if (nextPoly < prevPoly) {
+    nextPoly += polyLen;
+    if (busPoly < prevPoly) busPoly += polyLen;
+  }
+
+  const span = nextPoly - prevPoly;
+  if (span <= 0) return nextStop;
+
+  // Clamp `t` to [0, 1] because Passio occasionally reports a
+  // routePointPosition slightly outside the stop-to-stop polyline
+  // span when the bus is near a corner or stop geofence.
+  let t = (busPoly - prevPoly) / span;
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+
+  return ((prevStop + t) % M + M) % M;
+}
+
 /**
  * Compute the bus's fractional position along the route's stop sequence.
  *
- * Returns an integer when the bus is within a stop's radius (at the stop),
- * or N + 0.5 when in transit between stop N and stop N+1 in sequence.
- * Temporal smoothing rejects small circular-backward deltas (GPS jitter)
- * but accepts large backward jumps (real data corrections).
+ * Primary path: use Passio's authoritative `routeStopPosition` from the
+ * rich ETA shape (populated for the pinned route by
+ * refreshPinnedRoutePositions). No GPS math on our end.
  *
- * The segment (N, N+1) is chosen by picking the consecutive-sequence pair
- * whose straight-line segment is closest to the bus. This respects the
- * route's sequence from the start and is robust against routes with
- * revisited geometry (e.g. Tech Shuttle passes Tech Square twice — stops
- * 3 and 9 are geographically close but belong to different segments).
+ * Fallback paths: project the bus onto the route polyline, or walk
+ * straight-line segments between consecutive stops. Used when server
+ * position data isn't available (non-pinned route popups, first-load
+ * race before refreshPinnedRoutePositions finishes, etc.).
+ *
+ * Returns an integer when the bus is within a stop's radius (at the stop),
+ * or a fractional value when in transit. Falls back to the previous
+ * straight-line-segment heuristic only when precomputed geometry is
+ * missing for the route — preserves behavior for any route without
+ * polyline data.
+ *
+ * Temporal smoothing rejects tiny circular-backward deltas (GPS jitter at
+ * stop radii) but accepts larger backward motion as real corrections.
  *
  * Returns null if the bus has no coordinates or there are no stops.
  */
@@ -433,61 +933,100 @@ function computeBusFractionalIndex(bus, stops, routeId) {
   const M = stops.length;
   if (M === 1) return 0;
 
-  // Step 1: find the CONSECUTIVE-SEQUENCE segment (i, i+1) whose line the
-  // bus is closest to. Not "closest stop then look at its neighbors" —
-  // that geographic-closest-first search gets tripped up by revisited
-  // geometry. This walks the route in sequence order from the start.
-  let bestIdx = -1;
-  let bestDist = Infinity;
-  for (let i = 0; i < M; i++) {
-    const a = stops[i];
-    const b = stops[(i + 1) % M];
-    if (!Number.isFinite(a.latitude) || !Number.isFinite(a.longitude)) continue;
-    if (!Number.isFinite(b.latitude) || !Number.isFinite(b.longitude)) continue;
-    const d = distMetersToSegment(bus, a, b);
-    if (d < bestDist) {
-      bestDist = d;
-      bestIdx = i;
+  // Preferred path: use Passio's authoritative `routeStopPosition` and
+  // `routePointPosition` from the rich ETA shape (populated for the
+  // pinned route by refreshPinnedRoutePositions). Passio's server knows
+  // exactly which stop each bus is servicing next — no GPS projection
+  // needed. This is what fixes the lollipop-pass confusion cleanly.
+  let rawFrac = null;
+  const positionsForRoute = state.busRoutePositions.get(routeId);
+  if (positionsForRoute && bus.busNumber != null) {
+    const pos = positionsForRoute.get(String(bus.busNumber));
+    if (pos && Number.isFinite(pos.routeStopPosition)) {
+      rawFrac = fracIdxFromServerPosition(pos, routeId, M);
     }
   }
-  if (bestIdx === -1) return null;
 
-  // Step 2: at-stop vs in-transit, using Passio's per-stop geofence radius.
-  // If the bus is inside either endpoint's radius, snap to that integer
-  // index. Otherwise it's halfway between the two stops on this segment.
-  const aIdx = bestIdx;
-  const bIdx = (bestIdx + 1) % M;
-  const a = stops[aIdx];
-  const b = stops[bIdx];
-  const distA = distMeters(bus, a);
-  const distB = distMeters(bus, b);
-  const radA = Math.max(25, Number(a.radius) || 50);
-  const radB = Math.max(25, Number(b.radius) || 50);
-
-  let rawFrac;
-  if (distA <= radA && distA <= distB) {
-    rawFrac = aIdx;
-  } else if (distB <= radB) {
-    rawFrac = bIdx;
-  } else {
-    rawFrac = aIdx + 0.5;
-    if (rawFrac >= M) rawFrac -= M;
+  // Fallback path: project onto the polyline using our precomputed
+  // stopPolyIdx. Used when (a) the pinned panel hasn't populated server
+  // positions yet on first load, (b) a stop popup is rendering for a
+  // route we don't currently have position data for, or (c) Passio's
+  // rich shape is unavailable for any reason.
+  if (rawFrac == null && state.polyMeta.has(routeId) && state.stopPolyIdx.has(routeId)) {
+    const polyIdx = projectBusOntoPolyline(bus, routeId);
+    if (polyIdx != null) {
+      rawFrac = polyIdxToStopFracIdx(polyIdx, routeId);
+    }
   }
 
-  // Step 3: temporal smoothing. Reject small circular-backward deltas
-  // (GPS noise around the at-stop boundary), but accept large ones so
-  // real data corrections pass through.
+  // Legacy fallback: walk consecutive stop-to-stop straight-line segments.
+  // Reached only when routeData.routePoints is missing for this route —
+  // e.g. a new system we haven't configured polylines for. Preserves the
+  // old behavior so we never degrade an otherwise-working route.
+  if (rawFrac == null) {
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < M; i++) {
+      const a = stops[i];
+      const b = stops[(i + 1) % M];
+      if (!Number.isFinite(a.latitude) || !Number.isFinite(a.longitude)) continue;
+      if (!Number.isFinite(b.latitude) || !Number.isFinite(b.longitude)) continue;
+      const d = distMetersToSegment(bus, a, b);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) return null;
+
+    const aIdx = bestIdx;
+    const bIdx = (bestIdx + 1) % M;
+    const a = stops[aIdx];
+    const b = stops[bIdx];
+    const distA = distMeters(bus, a);
+    const distB = distMeters(bus, b);
+    const radA = Math.max(25, Number(a.radius) || 50);
+    const radB = Math.max(25, Number(b.radius) || 50);
+
+    if (distA <= radA && distA <= distB) {
+      rawFrac = aIdx;
+    } else if (distB <= radB) {
+      rawFrac = bIdx;
+    } else {
+      rawFrac = aIdx + 0.5;
+      if (rawFrac >= M) rawFrac -= M;
+    }
+  }
+
+  // Snap to integer indices when the bus is inside Passio's per-stop
+  // geofence radius. The polyline projection gives a continuous value;
+  // this lets the at-stop UI state fire at the same threshold as before.
+  {
+    const nearest = Math.round(rawFrac) % M;
+    const safeNearest = (nearest + M) % M;
+    const s = stops[safeNearest];
+    if (s && Number.isFinite(s.latitude) && Number.isFinite(s.longitude)) {
+      const rad = Math.max(25, Number(s.radius) || 50);
+      if (distMeters(bus, s) <= rad) {
+        rawFrac = safeNearest;
+      }
+    }
+  }
+
+  // Temporal smoothing: reject small circular-backward deltas (GPS noise
+  // at stop boundaries) but accept larger ones as real corrections. Kept
+  // even though projectBusOntoPolyline already enforces forward progress
+  // in polyline space, because (a) the wraparound boundary can produce
+  // apparent backward jumps when stops map unevenly, and (b) if we fell
+  // through to the legacy fallback above we still need this guard.
   const cacheKey = `${routeId}:${bus.id}`;
   const prev = state.lastBusFrac.get(cacheKey);
   const now = Date.now();
   let outFrac = rawFrac;
   if (prev && now - prev.time < 60000) {
     let delta = rawFrac - prev.frac;
-    // Circular shortest-arc correction.
     if (delta >  M / 2) delta -= M;
     if (delta < -M / 2) delta += M;
-    // Tiny backward wobble (≤ 1.0 stops): freeze at previous position.
-    // Larger backward motion (> 1 stop) is accepted as a real correction.
     if (delta < 0 && delta > -1.0) {
       outFrac = prev.frac;
     }
@@ -510,6 +1049,169 @@ function computeBusFractionalIndex(bus, stops, routeId) {
  * `stopsAway` is the integer count for text display; `stopsAwayFrac` is the
  * precise fractional distance (for smooth visual positioning on the track).
  */
+/**
+ * Strip the system prefix from a frontend route ID to get the raw Passio ID.
+ *   'mit:63220'    -> '63220'
+ *   'ezride:67265' -> '67265'
+ *   '63220'        -> '63220'   (legacy/unprefixed)
+ */
+function rawRouteIdFromPrefixed(routeId) {
+  if (routeId == null) return null;
+  const s = String(routeId);
+  const i = s.indexOf(':');
+  return i === -1 ? s : s.slice(i + 1);
+}
+
+/**
+ * Format a live ETA countdown for display on a bus icon. The caller is
+ * expected to have already computed `seconds` from the stored
+ * `arrivalEpochMs` minus `Date.now()`, so the value ticks down smoothly
+ * between server polls.
+ *
+ *   seconds <= 0   → "now"
+ *   seconds < 60   → "45s"
+ *   seconds < 3600 → "2m"  /  "2m 30s" (only under 10 min — avoids clutter
+ *                                        on longer ETAs where single-second
+ *                                        precision is nonsense)
+ *   seconds >= 3600 → "1h+"
+ */
+function formatEtaLabel(seconds) {
+  if (seconds == null || !Number.isFinite(seconds)) return '';
+  const s = Math.max(0, Math.round(seconds));
+  if (s <= 0) return 'now';
+  if (s < 60) return `${s}s`;
+  if (s >= 3600) return '1h+';
+  const mins = Math.floor(s / 60);
+  const rem = s % 60;
+  if (mins < 10 && rem >= 5) return `${mins}m ${rem}s`;
+  return `${mins}m`;
+}
+
+/**
+ * Look up the current ETA for a given bus at the currently pinned stop,
+ * measured against the client clock. Returns `null` when there is no ETA
+ * record (unknown bus, stale fetch, or the endpoint returned "no vehicles").
+ *
+ * Returns:
+ *   {
+ *     arrivalEpochMs: number,  // fixed at fetch time; the tick loop reads
+ *                               // this + Date.now() for a smooth countdown
+ *     solid: boolean,
+ *     stale: boolean,           // true when Passio's underlying position is
+ *                               // >90s old — the ETA is still shown but the
+ *                               // UI dims it so the user can discount it
+ *   }
+ */
+function etaForBus(bus) {
+  if (!bus || !bus.busNumber) return null;
+  const e = state.pinnedEtas.byBusName.get(String(bus.busNumber));
+  if (!e) return null;
+  const stale = e.updatedSecAgo != null && e.updatedSecAgo > 90;
+  return {
+    arrivalEpochMs: e.arrivalEpochMs,
+    solid: !!e.solid,
+    stale,
+  };
+}
+
+/**
+ * Refresh Passio's authoritative per-bus stop positions for the currently
+ * pinned route. This is what powers the route-aware bus progress in
+ * computeBusFractionalIndex — Passio tells us "bus 833 is next approaching
+ * stop index 1" and we just use that directly instead of projecting GPS
+ * onto the polyline. Never throws.
+ *
+ * Only queries the pinned route, not every route. The pinned panel is the
+ * only UI element that needs this data; stop popups for non-pinned routes
+ * still fall back to the polyline projection, which handles lollipop cases
+ * reasonably well and is free (no extra network round-trip).
+ */
+async function refreshPinnedRoutePositions() {
+  const pinned = state.pinnedStop;
+  if (!pinned) {
+    // Clear stale data when nothing is pinned. Other consumers still get
+    // the polyline-projection fallback for any route they care about.
+    state.busRoutePositions = new Map();
+    state.busRoutePositionsFetchedAtMs = 0;
+    return;
+  }
+  const rawRouteId = rawRouteIdFromPrefixed(pinned.routeId);
+  const list = await fetchRoutePositions(rawRouteId);
+
+  // If the pin changed while this fetch was in flight, don't overwrite.
+  if (!state.pinnedStop || state.pinnedStop.routeId !== pinned.routeId) return;
+
+  const byBusName = new Map();
+  for (const p of list) byBusName.set(p.busName, p);
+
+  const next = new Map();
+  next.set(pinned.routeId, byBusName);
+  state.busRoutePositions = next;
+  state.busRoutePositionsFetchedAtMs = Date.now();
+}
+
+/**
+ * Kick off an ETA fetch for the currently pinned stop. Uses a monotonic
+ * token so that if the user changes the pin mid-fetch, the stale response
+ * is discarded instead of overwriting the newer one. Never throws.
+ *
+ * When `renderOnSuccess` is true, re-renders the pinned panel as soon as
+ * the fetch lands so the user sees fresh minutes without waiting for the
+ * next poll tick. Used for the immediate fetch on pin change.
+ */
+async function refreshPinnedEtas({ renderOnSuccess = false } = {}) {
+  const pinned = state.pinnedStop;
+  if (!pinned) {
+    // Clear any stale data if nothing's pinned.
+    state.pinnedEtas.routeId = null;
+    state.pinnedEtas.stopId  = null;
+    state.pinnedEtas.byBusName.clear();
+    state.pinnedEtas.list = [];
+    state.pinnedEtas.fetchedAtMs = 0;
+    return;
+  }
+  const token = ++state.pinnedEtasInFlight;
+  const rawRouteId = rawRouteIdFromPrefixed(pinned.routeId);
+  const stopId = String(pinned.stopId);
+
+  const etas = await fetchStopETAs(rawRouteId, stopId);
+
+  // Discard if a newer fetch was started, or the user unpinned/repinned.
+  if (token !== state.pinnedEtasInFlight) return;
+  if (!state.pinnedStop) return;
+  if (state.pinnedStop.routeId !== pinned.routeId) return;
+  if (state.pinnedStop.stopId  !== pinned.stopId)  return;
+
+  state.pinnedEtas.routeId = pinned.routeId;
+  state.pinnedEtas.stopId  = stopId;
+  state.pinnedEtas.fetchedAtMs = Date.now();
+  state.pinnedEtas.list = etas;
+  state.pinnedEtas.byBusName.clear();
+  for (const e of etas) {
+    state.pinnedEtas.byBusName.set(String(e.busName), e);
+  }
+
+  if (renderOnSuccess) renderPinnedPanel();
+}
+
+/**
+ * Update the ETA countdown text on every `.track-bus-eta` element currently
+ * in the DOM, without re-rendering the whole panel. Reads `data-arrival-ms`
+ * and computes `(arrivalMs - Date.now()) / 1000` per tick. This is what lets
+ * the displayed time tick down between 5-second API polls.
+ */
+function updateEtaLabelsInPlace() {
+  const nowMs = Date.now();
+  const nodes = document.querySelectorAll('.track-bus-eta[data-arrival-ms], .overflow-eta[data-arrival-ms]');
+  for (const node of nodes) {
+    const arr = Number(node.getAttribute('data-arrival-ms'));
+    if (!Number.isFinite(arr)) continue;
+    const seconds = (arr - nowMs) / 1000;
+    const text = formatEtaLabel(seconds);
+    if (node.textContent !== text) node.textContent = text;
+  }
+}
+
 function computeStopArrivals(routeId, stopId) {
   const routeStops = state.routeData?.stops[routeId] || [];
   if (routeStops.length === 0) return null;
@@ -719,8 +1421,11 @@ function labelForTrackPos(trackPos) {
 /**
  * Render a single bus marker as an HTML string for the approach-line.
  * `labelPosition` is 'below' (even index) or 'above' (odd index) so adjacent
- * bus labels don't overlap. The visible label is just the distance text —
- * the bus ID lives in the tooltip for anyone who wants it.
+ * bus labels don't overlap. The visible label is the distance text plus a
+ * second-line live-ETA countdown when one is available from Passio.
+ *
+ * The ETA element carries its own `data-arrival-ms` so the 1-second tick
+ * loop can advance the countdown without re-rendering the whole panel.
  */
 function renderTrackBusHTML(bus, labelText, trackPos, proximity, labelPosition) {
   const busLabel = bus.busNumber || bus.id;
@@ -730,13 +1435,29 @@ function renderTrackBusHTML(bus, labelText, trackPos, proximity, labelPosition) 
   const rawRatio = span > 0 ? trackPos / span : 0;
   const ratio = Math.min(Math.max(rawRatio, 0), 1).toFixed(3);
 
+  // ETA subline, if Passio has one for this bus. We render the element
+  // whether or not we could compute text, because the tick loop updates
+  // it by attribute — text will appear on the next tick even if the first
+  // render is empty (shouldn't happen, but cheap to be safe).
+  const eta = etaForBus(bus);
+  let etaHtml = '';
+  let titleExtra = '';
+  if (eta) {
+    const seconds = (eta.arrivalEpochMs - Date.now()) / 1000;
+    const text = formatEtaLabel(seconds);
+    const etaClass = `track-bus-eta${eta.stale ? ' stale' : ''}${eta.solid ? '' : ' soft'}`;
+    etaHtml = `<div class="${etaClass}" data-arrival-ms="${eta.arrivalEpochMs}">${text}</div>`;
+    titleExtra = ` — ETA ${text}`;
+  }
+
   return `
     <div class="track-bus ${proximity} label-${labelPosition}"
          data-bus-id="${bus.id}"
          style="--offset-ratio: ${ratio}"
-         title="Bus ${busLabel} — ${labelText}">
+         title="Bus ${busLabel} — ${labelText}${titleExtra}">
       <div class="track-bus-dot">🚌</div>
       <div class="track-bus-label">${labelText}</div>
+      ${etaHtml}
     </div>
   `;
 }
@@ -843,11 +1564,19 @@ function renderPinnedPanel() {
 
   // Text list under the track detailing each bus beyond the 6-stop window.
   // The 6+ marker on the line is the summary; this row gives the actual
-  // stops-away numbers so the user still knows how far out they are.
+  // stops-away numbers so the user still knows how far out they are. When
+  // Passio has a live ETA for the bus we tack it on in parentheses, with
+  // its own data-arrival-ms so the tick loop keeps the minutes fresh.
   let overflowHtml = '';
   if (overflow.length > 0) {
-    const parts = overflow.map(({ stopsAway }) => {
-      return `<span class="overflow-item">${formatStopsAwayText(stopsAway)}</span>`;
+    const parts = overflow.map(({ bus, stopsAway }) => {
+      const stopsText = formatStopsAwayText(stopsAway);
+      const eta = etaForBus(bus);
+      if (!eta) return `<span class="overflow-item">${stopsText}</span>`;
+      const seconds = (eta.arrivalEpochMs - Date.now()) / 1000;
+      const text = formatEtaLabel(seconds);
+      const cls = `overflow-eta${eta.stale ? ' stale' : ''}${eta.solid ? '' : ' soft'}`;
+      return `<span class="overflow-item">${stopsText} <span class="${cls}" data-arrival-ms="${eta.arrivalEpochMs}">${text}</span></span>`;
     });
     overflowHtml = `<div class="pinned-overflow"><span class="overflow-prefix">Also approaching:</span> ${parts.join(' · ')}</div>`;
   }
@@ -1085,7 +1814,20 @@ function updateStatus(connected, message) {
  */
 async function updateData() {
   try {
-    const { vehicles, errors } = await fetchAllVehicles();
+    // Fetch bus GPS, pinned-stop ETAs, and authoritative per-bus route
+    // positions all in parallel. The ETA and positions calls each wrap
+    // their own errors (never reject), so a failure in either can't
+    // block the GPS update that the map depends on.
+    //
+    // `refreshPinnedRoutePositions` is the key change that makes
+    // lollipop routes work correctly: it asks Passio "which stop is
+    // each bus approaching?" instead of making us guess from lat/lng.
+    const [vehiclesResult] = await Promise.all([
+      fetchAllVehicles(),
+      refreshPinnedEtas(),
+      refreshPinnedRoutePositions(),
+    ]);
+    const { vehicles, errors } = vehiclesResult;
     state.vehicles = vehicles;
 
     updateVehicleMarkers(state.vehicles);
@@ -1580,6 +2322,20 @@ async function init() {
     state.routes = routes;
     state.routeData = routeData;
 
+    // Precompute polyline geometry for every route that has a polyline.
+    // This is the engine behind route-aware bus progress (lollipop-safe
+    // matching on out-and-back segments like Grad Junction West). It's a
+    // one-time cost at startup — ~334 vertices × 12 stops for Tech
+    // Shuttle is measured in microseconds, and nothing re-runs it at
+    // poll time.
+    for (const routeId of Object.keys(routeData.routePoints || {})) {
+      try {
+        precomputeRouteGeometry(routeId);
+      } catch (e) {
+        console.warn(`Could not precompute geometry for ${routeId}:`, e);
+      }
+    }
+
     if (errors.length > 0) {
       const failed = errors.map(e => SYSTEMS[e.systemKey]?.label || e.systemKey);
       const uniqueFailed = [...new Set(failed)].join(', ');
@@ -1607,6 +2363,13 @@ async function init() {
     // Start periodic updates
     state.updateTimer = setInterval(updateData, UPDATE_INTERVAL);
 
+    // Separate 1-second tick that advances ETA countdowns in place on the
+    // already-rendered DOM, so the displayed "3m 42s" decrements smoothly
+    // instead of only updating once every 5-second API poll. Pauses
+    // implicitly when nothing is pinned (the loop is a no-op because there
+    // are no matching DOM nodes).
+    state.etaTickTimer = setInterval(updateEtaLabelsInPlace, 1000);
+
     console.log('✅ MIT Shuttle Tracker initialized');
 
   } catch (error) {
@@ -1614,6 +2377,10 @@ async function init() {
     updateStatus(false, 'Failed to load - check console');
   }
 }
+
+// TEMP: expose state on window for live debugging of polyline geometry.
+// Safe to remove — nothing reads this outside the browser devtools.
+if (typeof window !== 'undefined') window.__shuttleState = state;
 
 // Start the app
 init();

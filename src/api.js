@@ -302,6 +302,212 @@ export async function fetchAllRoutesAndData() {
 }
 
 /**
+ * Fetch ETAs for a single (routeId, stopId) from Passio's undocumented
+ * `eta=3` endpoint. This is a GET, not a POST, and takes a single stopId —
+ * multi-stop queries ({@code stopIds=a,b} / {@code stopIds[]=a&stopIds[]=b}
+ * / repeated params) all return only one stop, so callers that need ETAs
+ * for multiple stops must parallelize the requests.
+ *
+ * routeId and stopId must be RAW Passio ids (no `mit:` / `ezride:` prefix).
+ *
+ * Passio serves TWO different response shapes from this endpoint depending
+ * on whether their "solid ETA" path (historical DB lookup) is currently
+ * healthy. We tolerate both:
+ *
+ *  - "solid" shape (what we usually see): {busName, secondsSpent, eta, etaR,
+ *    solid:1, updatedSecAgo, driver, paxLoadS, scheduleTimes, ...} — no
+ *    deviceId, no busId, no arrivalTimestamp.
+ *  - "live" shape (fallback when solid DB lookup errors): a much richer
+ *    payload including {deviceId, busId, routePointPosition,
+ *    busProjectionLatlng, arrivalTimestamp, ...}.
+ *
+ * `busName` is the one field guaranteed in both shapes, and it matches
+ * `vehicle.busNumber` in the rest of the app — that's how callers should
+ * join ETAs back to bus records.
+ *
+ * "No buses" is encoded as a sentinel entry under stop key "0000" with
+ * `eta === "no vehicles"` and `secondsSpent === 86400`; we filter those out
+ * and return an empty array.
+ *
+ * Returns an array of:
+ *   {
+ *     busName:        string,          // user-facing bus number, e.g. "210"
+ *     deviceId:       string | null,   // present only in "live" shape
+ *     busId:          string | null,   // present only in "live" shape
+ *     secondsUntil:   number,          // seconds until arrival (integer)
+ *     arrivalEpochMs: number,          // client-clock arrival timestamp (ms)
+ *     solid:          boolean,         // true if Passio's DB-backed prediction
+ *     updatedSecAgo:  number | null,   // staleness of underlying bus position
+ *     outOfService:   boolean,
+ *     speed:          number | null,   // only in "live" shape
+ *     raw:            object           // original entry for debugging
+ *   }
+ *
+ * Never throws — errors are logged and an empty array is returned, so a
+ * failing ETA call cannot break the main render loop.
+ */
+export async function fetchStopETAs(routeIdRaw, stopIdRaw) {
+  if (!routeIdRaw || !stopIdRaw) return [];
+
+  const params = new URLSearchParams({
+    eta: '3',
+    routeId: String(routeIdRaw),
+    stopIds: String(stopIdRaw),
+  });
+  const url = `${BASE_URL}/mapGetData.php?${params.toString()}`;
+
+  let data;
+  try {
+    const response = await fetch(url, { method: 'GET' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    data = await response.json();
+  } catch (error) {
+    console.warn(`ETA fetch failed for route=${routeIdRaw} stop=${stopIdRaw}:`, error);
+    return [];
+  }
+
+  const etaMap = data?.ETAs || {};
+  // Anchor countdowns to the CLIENT clock rather than Passio's
+  // `arrivalTimestamp` (which is server time and can drift). `secondsSpent`
+  // is relative to "now" on the server, which matches "now" on the client
+  // closely enough for second-level ETAs.
+  const nowMs = Date.now();
+
+  const out = [];
+  for (const [stopKey, arr] of Object.entries(etaMap)) {
+    if (!Array.isArray(arr)) continue;
+    // "No vehicles" sentinel — stopKey "0000" with placeholder entries.
+    if (stopKey === '0000') continue;
+    for (const e of arr) {
+      if (!e || typeof e !== 'object') continue;
+      if (e.eta === 'no vehicles') continue;
+      if (!e.busName) continue; // can't join back to a bus without a name
+      // secondsSpent >= 86400 is Passio's "no prediction available" marker.
+      const secs = Number(e.secondsSpent);
+      if (!Number.isFinite(secs) || secs >= 86400) continue;
+      const secsClamped = Math.max(0, Math.round(secs));
+      const updatedAgoNum = Number(e.updatedSecAgo);
+      out.push({
+        busName:  String(e.busName),
+        deviceId: e.deviceId != null ? String(e.deviceId) : null,
+        busId:    e.busId    != null ? String(e.busId)    : null,
+        secondsUntil:   secsClamped,
+        arrivalEpochMs: nowMs + secsClamped * 1000,
+        solid: e.solid === 1 || e.solid === '1' || e.solid === true,
+        updatedSecAgo: Number.isFinite(updatedAgoNum) ? updatedAgoNum : null,
+        outOfService:  !!e.OOS || e.outOfService === true,
+        speed: Number.isFinite(Number(e.speed)) ? Number(e.speed) : null,
+        raw: e,
+      });
+    }
+  }
+
+  // Sort by soonest first so the caller doesn't have to.
+  out.sort((a, b) => a.secondsUntil - b.secondsUntil);
+  return out;
+}
+
+/**
+ * Fetch authoritative per-bus route positions for a single route.
+ *
+ * This hits the same `eta=3` endpoint as fetchStopETAs, but WITHOUT a
+ * `stopIds` parameter. That query mode returns the rich "live" response
+ * shape — a per-bus record for every bus on the route, including:
+ *
+ *   - `routeStopPosition`  — the integer service-sequence index of the
+ *                            bus's current/next stop. This is the field
+ *                            that makes the whole pinned-panel math work
+ *                            without GPS projection on our end.
+ *   - `routePointPosition` — the bus's current polyline vertex index
+ *                            (-1 when dwelling at a stop). Used to
+ *                            interpolate fractional progress between
+ *                            stops for smooth UI positioning.
+ *   - `stopRoutePointPosition`, `tripId`, `routeBlockId`, `dwell`, etc.
+ *
+ * Important semantic note about this response shape:
+ *
+ *   Every bus record is nested under a top-level stop key (Passio appears
+ *   to aggregate the whole route under its "home" stop), and the
+ *   `secondsSpent` / `eta` fields in this shape are the ETA to THAT
+ *   outer-key stop — i.e. the route's terminus, not the bus's next stop.
+ *   So don't use `secondsSpent` from here for per-stop ETAs — use
+ *   `fetchStopETAs()` with an explicit `stopIds` for that.
+ *
+ * Returns an array of:
+ *   {
+ *     busName:                string,
+ *     routeStopPosition:      number,          // 0-indexed into service sequence
+ *     routePointPosition:     number | null,   // null when -1 / invalid
+ *     stopRoutePointPosition: number | null,
+ *     tripId:                 string | null,
+ *     routeBlockId:           string | null,
+ *     dwell:                  number | null,   // seconds spent at current stop
+ *     raw:                    object,
+ *   }
+ *
+ * Never throws — errors are logged and an empty array is returned so a
+ * failing position fetch can't break the rest of the render loop.
+ */
+export async function fetchRoutePositions(routeIdRaw) {
+  if (!routeIdRaw) return [];
+
+  const params = new URLSearchParams({
+    eta: '3',
+    routeId: String(routeIdRaw),
+  });
+  const url = `${BASE_URL}/mapGetData.php?${params.toString()}`;
+
+  let data;
+  try {
+    const response = await fetch(url, { method: 'GET' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    data = await response.json();
+  } catch (error) {
+    console.warn(`Position fetch failed for route=${routeIdRaw}:`, error);
+    return [];
+  }
+
+  const etaMap = data?.ETAs || {};
+  const out = [];
+  for (const [stopKey, arr] of Object.entries(etaMap)) {
+    if (!Array.isArray(arr)) continue;
+    // "No vehicles" sentinel: stopKey "0000" with placeholder entries.
+    if (stopKey === '0000') continue;
+    for (const e of arr) {
+      if (!e || typeof e !== 'object') continue;
+      if (!e.busName) continue;
+      if (e.eta === 'no vehicles') continue;
+
+      // routeStopPosition is the field we actually care about. If it's
+      // missing or non-numeric, we can't use this record at all.
+      const rsp = Number(e.routeStopPosition);
+      if (!Number.isFinite(rsp)) continue;
+
+      const rpp = Number(e.routePointPosition);
+      // Passio uses -1 as "currently at a stop, no in-transit polyline
+      // index." Normalize to null so callers can check one thing.
+      const rppNormalized = Number.isFinite(rpp) && rpp >= 0 ? rpp : null;
+
+      const srpp = Number(e.stopRoutePointPosition);
+      const dwell = Number(e.dwell);
+
+      out.push({
+        busName: String(e.busName),
+        routeStopPosition: rsp,
+        routePointPosition: rppNormalized,
+        stopRoutePointPosition: Number.isFinite(srpp) ? srpp : null,
+        tripId:       e.tripId       != null ? String(e.tripId)       : null,
+        routeBlockId: e.routeBlockId != null ? String(e.routeBlockId) : null,
+        dwell: Number.isFinite(dwell) ? dwell : null,
+        raw: e,
+      });
+    }
+  }
+
+  return out;
+}
+
+/**
  * Fetch real-time vehicles from every configured system in parallel.
  * Returns a flat vehicles array plus any per-system errors.
  */
@@ -333,6 +539,8 @@ export const API = {
   fetchRouteData,
   fetchAllRoutesAndData,
   fetchAllVehicles,
+  fetchStopETAs,
+  fetchRoutePositions,
   SYSTEMS,
   MIT_SYSTEM_ID,
 };
