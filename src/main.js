@@ -1627,6 +1627,110 @@ function updateRouteDisplay() {
 }
 
 /**
+ * Compute the lat/lng bounding box that covers every polyline and every
+ * stop belonging to a route currently toggled on in the route display.
+ * Returns a Leaflet `LatLngBounds`, or `null` if nothing is visible.
+ *
+ * We walk both polylines and stops because on a partially-loaded map
+ * (e.g. a route whose polyline is missing for some reason) the stops
+ * alone still let us produce a reasonable frame. And because polyline
+ * vertices exist at many more points than stops do, they dominate the
+ * bounds on any route we DO have geometry for — which is usually what
+ * we want (the frame follows the road, not just the stops).
+ */
+function computeVisibleRouteBounds() {
+  const bounds = L.latLngBounds([]);
+  let extended = false;
+
+  for (const [routeId, isShowing] of state.routeDisplay) {
+    if (!isShowing) continue;
+
+    const polyPts = state.routeData?.routePoints?.[routeId];
+    if (Array.isArray(polyPts)) {
+      for (const p of polyPts) {
+        if (Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1])) {
+          bounds.extend(p);
+          extended = true;
+        }
+      }
+    }
+
+    const stops = state.routeData?.stops?.[routeId];
+    if (Array.isArray(stops)) {
+      for (const s of stops) {
+        if (Number.isFinite(s.latitude) && Number.isFinite(s.longitude)) {
+          bounds.extend([s.latitude, s.longitude]);
+          extended = true;
+        }
+      }
+    }
+  }
+
+  return extended ? bounds : null;
+}
+
+/**
+ * Zoom + pan the map so every currently-visible route fits cleanly
+ * inside the on-screen map area. "On-screen" here is narrower than
+ * the map container itself because the pinned-stop panel overlays the
+ * top of the map and, on mobile, the bottom sheet handle overlays the
+ * bottom. We read both from the live DOM so the padding always matches
+ * what the user actually sees, rather than hard-coding constants that
+ * would drift when panel heights change.
+ *
+ * Called:
+ *   - Once on init() after the first data load, so first-run visitors
+ *     land on a sensible frame instead of the hard-coded MIT center.
+ *   - On every user route toggle, so turning routes on/off reframes
+ *     the map to match.
+ *
+ * No-ops if no routes are toggled on — we leave the current view alone
+ * rather than jumping to some arbitrary default.
+ */
+function fitMapToVisibleRoutes({ animate = true } = {}) {
+  if (!state.map) return;
+
+  // Make sure Leaflet's idea of the container size is current. The
+  // pinned panel can show/hide between renders, which changes the
+  // map container's box without Leaflet knowing about it.
+  state.map.invalidateSize({ animate: false, pan: false });
+
+  const bounds = computeVisibleRouteBounds();
+  if (!bounds || !bounds.isValid()) return;
+
+  // Measure overlays so we can pad around them. offsetHeight returns 0
+  // for hidden elements, so the hidden-state case handles itself.
+  const pinnedPanel = document.getElementById('pinned-panel');
+  const pinnedHeight = pinnedPanel && !pinnedPanel.classList.contains('hidden')
+    ? pinnedPanel.offsetHeight
+    : 0;
+
+  // On mobile the sidebar is a bottom sheet that overlays the bottom
+  // of the map. In its collapsed state only the handle is visible —
+  // ~70px per initMobileSheet. On desktop the sidebar is a sibling
+  // of the map, not an overlay, so no bottom reserve is needed.
+  const isMobile = window.innerWidth <= 768;
+  const sidebar = document.getElementById('sidebar');
+  const sheetCollapsed = sidebar?.classList.contains('collapsed');
+  const bottomReserve = isMobile
+    ? (sheetCollapsed ? 80 : Math.min(sidebar?.offsetHeight ?? 0, 260))
+    : 0;
+
+  state.map.fitBounds(bounds, {
+    // paddingTopLeft / paddingBottomRight let us pad the top more than
+    // the bottom (to clear the pinned panel) without cropping the route
+    // unnecessarily on either side.
+    paddingTopLeft:    [24, pinnedHeight + 24],
+    paddingBottomRight:[24, bottomReserve + 24],
+    // Clamp how far Leaflet is willing to zoom IN. Without this, a
+    // small route (just a couple close stops) would zoom to street
+    // level and lose all context.
+    maxZoom: 17,
+    animate,
+  });
+}
+
+/**
  * A vehicle is "focused" when its route is currently toggled on. Buses on
  * non-focused routes are rendered tinted so the user's current selection
  * stands out visually.
@@ -1778,6 +1882,11 @@ function renderRouteFilters() {
       
       // Update map display
       updateRouteDisplay();
+
+      // Reframe the map so the newly-toggled route is visible. Animated
+      // so the user can see the zoom transition as a direct result of
+      // their click, not a mysterious jump.
+      fitMapToVisibleRoutes({ animate: true });
     });
   });
 }
@@ -2359,6 +2468,15 @@ async function init() {
 
     // Initial vehicle update
     await updateData();
+
+    // Now that the pinned panel has been rendered (by updateData ->
+    // renderPinnedPanel), its DOM height is measurable — which means
+    // fitMapToVisibleRoutes can pad around it correctly. Run it on
+    // the next animation frame so any layout-affecting render from
+    // updateData has already landed. No animation on first fit — the
+    // user shouldn't see the map "swoosh" into place, it should just
+    // open already framed.
+    requestAnimationFrame(() => fitMapToVisibleRoutes({ animate: false }));
 
     // Start periodic updates
     state.updateTimer = setInterval(updateData, UPDATE_INTERVAL);
