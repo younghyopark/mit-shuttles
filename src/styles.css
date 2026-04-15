@@ -119,6 +119,305 @@ body {
   50% { opacity: 0.5; }
 }
 
+/* Pinned stop panel — a single stop with an approach-line visualization */
+.pinned-panel {
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  padding: 0.55rem 0.85rem 0.7rem;
+  z-index: 900;
+}
+
+.pinned-panel.hidden {
+  display: none;
+}
+
+/* Header row: chip + stop name/subtitle + unpin button */
+.pinned-header {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding-right: 0.25rem;
+}
+
+.pinned-title-group {
+  flex: 1;
+  min-width: 0;
+}
+
+.pinned-stop-name {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.2;
+}
+
+.pinned-subtitle {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.25;
+}
+
+.pinned-header .unpin-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 4px 8px;
+  line-height: 1;
+  border-radius: 4px;
+}
+
+.pinned-header .unpin-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* Approach-line track: horizontal line, previous-stop dots, stop at right,
+   and bus markers that slide smoothly along it. The coordinate system is
+   a --offset-ratio in [0, 1] where 0 = destination and 1 = 6 stops away. */
+.pinned-track {
+  position: relative;
+  height: 84px;
+  margin-top: 0.55rem;
+  /* Shared placement helpers for all dots on the line. The line itself sits
+     at top: 42px; markers are centered on it vertically. */
+}
+
+.track-line {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  top: 42px;
+  height: 2px;
+  background: linear-gradient(
+    to right,
+    rgba(255, 255, 255, 0.06) 0%,
+    rgba(255, 255, 255, 0.22) 20%,
+    var(--pin-color, var(--primary)) 100%
+  );
+}
+
+/* Small faint dots marking the N previous stops on the route */
+.track-prev-dot {
+  position: absolute;
+  top: 42px;
+  right: calc(18px + var(--offset-ratio, 0.5) * (100% - 36px));
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  transform: translate(50%, -50%);
+  z-index: 1;
+}
+
+.track-stop {
+  position: absolute;
+  right: 18px;
+  top: 42px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--pin-color, var(--primary));
+  border: 2px solid rgba(255, 255, 255, 0.95);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  z-index: 4;
+  transform: translate(50%, -50%);
+}
+
+/* Subtle ring pulse on the destination when a bus is arriving */
+.pinned-track.arriving .track-stop::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
+  border-radius: 50%;
+  border: 2px solid var(--pin-color, var(--primary));
+  animation: stopPulse 1.6s ease-out infinite;
+}
+
+@keyframes stopPulse {
+  0%   { opacity: 0.8; transform: scale(0.85); }
+  100% { opacity: 0;   transform: scale(1.6);  }
+}
+
+/* Bus marker on the track, positioned via --offset-ratio (0–1).
+   0 = at the destination (right edge), 1 = 6 stops away (left edge). */
+.track-bus {
+  position: absolute;
+  top: 42px;
+  right: calc(18px + var(--offset-ratio, 0.5) * (100% - 36px));
+  z-index: 3;
+  transform: translate(50%, -50%);
+  pointer-events: none;
+}
+
+.track-bus-dot {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: rgba(20, 20, 36, 0.92);
+  border: 2px solid var(--pin-color, var(--primary));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.55);
+}
+
+.track-bus.arriving .track-bus-dot {
+  animation: busArrive 1.3s ease-in-out infinite;
+}
+
+@keyframes busArrive {
+  0%, 100% { transform: scale(1);    }
+  50%      { transform: scale(1.12); }
+}
+
+/* Alternating label positions keep adjacent labels from overlapping: even-
+   index buses get their label below the marker, odd-index above. */
+.track-bus-label {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.62rem;
+  white-space: nowrap;
+  color: var(--text-muted);
+  line-height: 1.15;
+  text-align: center;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(22, 33, 62, 0.78);
+  pointer-events: none;
+}
+
+.track-bus.label-below .track-bus-label {
+  top: 20px;
+}
+
+.track-bus.label-above .track-bus-label {
+  bottom: 20px;
+}
+
+.track-bus-label strong {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.track-bus.arriving .track-bus-label strong {
+  color: #10b981;
+}
+
+.track-bus.near .track-bus-label strong {
+  color: #f59e0b;
+}
+
+.track-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-style: italic;
+  pointer-events: none;
+}
+
+.track-empty.hidden {
+  display: none;
+}
+
+/* Overflow text list for buses beyond the 6-stop window */
+.pinned-overflow {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  margin-top: 0.35rem;
+  white-space: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+  line-height: 1.3;
+}
+
+.pinned-overflow::-webkit-scrollbar {
+  display: none;
+}
+
+.pinned-overflow.hidden {
+  display: none;
+}
+
+.pinned-overflow .overflow-prefix {
+  color: var(--text-muted);
+  margin-right: 0.25rem;
+}
+
+.pinned-overflow .overflow-item {
+  color: var(--text-muted);
+  margin-right: 0.25rem;
+}
+
+.pinned-overflow .overflow-item strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.pinned-bus-line.arriving {
+  color: #10b981;
+}
+
+.pinned-bus-line.near {
+  color: #f59e0b;
+}
+
+.pinned-bus-line.muted {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.pinned-bus-line strong {
+  font-weight: 700;
+}
+
+/* Pin button inside stop popup */
+.stop-popup .pin-btn {
+  display: block;
+  width: 100%;
+  margin-top: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+
+.stop-popup .pin-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.stop-popup .pin-btn.pinned {
+  background: rgba(16, 185, 129, 0.15);
+  border-color: #10b981;
+  color: #10b981;
+}
+
 /* Main layout */
 .main {
   display: flex;

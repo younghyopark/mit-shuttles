@@ -19,10 +19,17 @@ const UPDATE_INTERVAL = 5000;
 // LocalStorage key for route display preferences
 const STORAGE_KEY = 'mit-shuttle-route-display';
 
+// LocalStorage key for the single pinned stop (singular in the new model)
+const PINNED_STOP_KEY = 'mit-shuttle-pinned-stop';
+// Legacy plural key for migration from the multi-pin model
+const LEGACY_PINNED_STOPS_KEY = 'mit-shuttle-pinned-stops';
+
 // Default focused route for first-time visitors: Tech Shuttle.
-// If a user has never toggled any route, we auto-enable this one so the
-// map isn't a blank slate and the user immediately sees something useful.
 const DEFAULT_FOCUSED_ROUTE_ID = 'mit:63220';
+
+// Default pinned stop for first-time visitors: "Grad Junction West" on Tech Shuttle.
+// Gives the user an immediately useful arrival panel on first load.
+const DEFAULT_PINNED_STOP = { routeId: 'mit:63220', stopId: '180113' };
 
 // Application state
 const state = {
@@ -34,6 +41,7 @@ const state = {
   routeLines: new Map(),      // Route polylines
   stopMarkers: new Map(),     // Stop markers grouped by route
   routeData: null,            // Route points and stops data
+  pinnedStop: null,           // Single { routeId, stopId } or null
   updateTimer: null
 };
 
@@ -109,6 +117,89 @@ function loadRouteDisplayPrefs() {
 function chipFor(prefixedRouteId) {
   const systemKey = String(prefixedRouteId).split(':')[0];
   return SYSTEMS[systemKey]?.chip || '';
+}
+
+/**
+ * Load the single pinned stop from localStorage.
+ * - Migrates any legacy plural-array format by taking the first entry.
+ * - First-time visitors (no saved state) get the default pin.
+ * - Returns null only if the user has explicitly cleared their pin.
+ */
+function loadPinnedStop() {
+  // Migrate any legacy plural key written by the old multi-pin model.
+  const legacy = localStorage.getItem(LEGACY_PINNED_STOPS_KEY);
+  if (legacy !== null) {
+    try {
+      const arr = JSON.parse(legacy);
+      if (Array.isArray(arr) && arr.length > 0 &&
+          arr[0] && typeof arr[0].routeId === 'string' && typeof arr[0].stopId === 'string') {
+        localStorage.setItem(PINNED_STOP_KEY, JSON.stringify(arr[0]));
+      }
+    } catch {
+      // ignore parse failures
+    }
+    localStorage.removeItem(LEGACY_PINNED_STOPS_KEY);
+  }
+
+  const saved = localStorage.getItem(PINNED_STOP_KEY);
+
+  // First-time visitor: seed with the default pin.
+  if (saved === null) {
+    return { ...DEFAULT_PINNED_STOP };
+  }
+
+  try {
+    const parsed = JSON.parse(saved);
+    if (parsed && typeof parsed.routeId === 'string' && typeof parsed.stopId === 'string') {
+      return parsed;
+    }
+    // Explicit "null" saved means the user cleared their pin.
+    return null;
+  } catch (e) {
+    console.warn('Could not load pinned stop:', e);
+    return null;
+  }
+}
+
+/**
+ * Persist the current state.pinnedStop. Writes `null` (as a string) when
+ * cleared so load can distinguish "user cleared" from "first-time visit".
+ */
+function savePinnedStop() {
+  try {
+    localStorage.setItem(PINNED_STOP_KEY, JSON.stringify(state.pinnedStop));
+  } catch (e) {
+    console.warn('Could not save pinned stop:', e);
+  }
+}
+
+/**
+ * Is this (routeId, stopId) the currently pinned stop?
+ */
+function isStopPinned(routeId, stopId) {
+  return !!state.pinnedStop &&
+    state.pinnedStop.routeId === routeId &&
+    state.pinnedStop.stopId === stopId;
+}
+
+/**
+ * Pin a (routeId, stopId). Replaces any existing pin.
+ */
+function pinStop(routeId, stopId) {
+  state.pinnedStop = { routeId, stopId };
+  savePinnedStop();
+  renderPinnedPanel();
+}
+
+/**
+ * Clear the pinned stop (whether it matches the given args or not — the
+ * one-pin model has nothing else to unpin). Saves + re-renders.
+ */
+function unpinStop() {
+  if (state.pinnedStop === null) return;
+  state.pinnedStop = null;
+  savePinnedStop();
+  renderPinnedPanel();
 }
 
 /**
@@ -233,43 +324,158 @@ function drawStopMarkers() {
 }
 
 /**
- * Create popup content for a stop with bus distance info
+ * Euclidean distance between two {latitude, longitude} points.
+ * Good enough for neighborhood-scale stop-spacing comparisons.
+ */
+function euclid(a, b) {
+  return Math.sqrt(
+    Math.pow(a.latitude - b.latitude, 2) +
+    Math.pow(a.longitude - b.longitude, 2)
+  );
+}
+
+/**
+ * Project `point` onto the straight-line segment A→B and return the
+ * fraction t ∈ [0, 1] where that projection lies.
+ * t=0 means the projection is at A; t=1 means it's at B.
+ * Values outside [0, 1] are clamped so a bus "past" an endpoint snaps to it.
+ */
+function projectFractionOnSegment(point, A, B) {
+  const dx = B.latitude - A.latitude;
+  const dy = B.longitude - A.longitude;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return 0;
+
+  const t = (
+    (point.latitude  - A.latitude ) * dx +
+    (point.longitude - A.longitude) * dy
+  ) / lenSq;
+
+  return Math.max(0, Math.min(1, t));
+}
+
+/**
+ * Compute the bus's *fractional* position along the route's stop sequence.
+ * Returns a number in [0, M) where integer values correspond to stops;
+ * e.g. 3.5 means the bus is halfway between stop 3 and stop 4.
+ *
+ * Interpolation is a geometric projection onto the line segment between two
+ * adjacent stops (not a ratio of raw distances), so the fractional value is
+ * strictly bounded by the two integer stop positions it sits between.
+ * Returns null if there are no stops or the bus has no coordinates.
+ */
+function computeBusFractionalIndex(bus, stops) {
+  if (!stops || stops.length === 0) return null;
+  if (typeof bus.latitude !== 'number' || typeof bus.longitude !== 'number') return null;
+
+  const M = stops.length;
+  if (M === 1) return 0;
+
+  // Find the closest stop.
+  let closestIdx = -1;
+  let closestDist = Infinity;
+  for (let i = 0; i < M; i++) {
+    const s = stops[i];
+    if (typeof s.latitude !== 'number' || typeof s.longitude !== 'number') continue;
+    const d = euclid(bus, s);
+    if (d < closestDist) {
+      closestDist = d;
+      closestIdx = i;
+    }
+  }
+  if (closestIdx === -1) return null;
+
+  // Of the two neighbors, pick the one the bus is closer to — the bus is
+  // somewhere on the segment between closestIdx and that neighbor.
+  const prevIdx = (closestIdx - 1 + M) % M;
+  const nextIdx = (closestIdx + 1) % M;
+  const distPrev = euclid(bus, stops[prevIdx]);
+  const distNext = euclid(bus, stops[nextIdx]);
+
+  const otherIdx = distPrev <= distNext ? prevIdx : nextIdx;
+
+  // Project the bus onto the straight-line segment between the two stops and
+  // read off the fraction (clamped to [0, 1]). This keeps the fractional
+  // index strictly bounded between the two adjacent integer stop positions.
+  const fracToward = projectFractionOnSegment(bus, stops[closestIdx], stops[otherIdx]);
+
+  // Compose the effective fractional index, handling circular wraparound.
+  let effective;
+  if (otherIdx === nextIdx) {
+    effective = closestIdx + fracToward;
+  } else if (closestIdx === 0 && otherIdx === M - 1) {
+    // Walking "backward" from stop 0 wraps to M-1.
+    effective = M - fracToward;
+  } else {
+    effective = closestIdx - fracToward;
+  }
+
+  // Normalize to [0, M).
+  while (effective < 0) effective += M;
+  while (effective >= M) effective -= M;
+
+  return effective;
+}
+
+/**
+ * Compute bus arrivals for a given (routeId, stopId). Shared by the stop
+ * popup and the pinned panel so they stay in sync.
+ *
+ * Returns: {
+ *   stop, stopIndex, totalStops, routeName,
+ *   arrivals: [{ bus, stopsAway, stopsAwayFrac }] sorted by stopsAwayFrac
+ * }
+ * or null if the route/stop is not in state.routeData.
+ *
+ * `stopsAway` is the integer count for text display; `stopsAwayFrac` is the
+ * precise fractional distance (for smooth visual positioning on the track).
+ */
+function computeStopArrivals(routeId, stopId) {
+  const routeStops = state.routeData?.stops[routeId] || [];
+  if (routeStops.length === 0) return null;
+
+  const stopIndex = routeStops.findIndex(s => String(s.id) === String(stopId));
+  if (stopIndex === -1) return null;
+
+  const stop = routeStops[stopIndex];
+  const totalStops = routeStops.length;
+  const routeInfo = state.routeData?.routeInfo[routeId] || {};
+  const routeName = stop.routeName || routeInfo.name || 'Unknown';
+
+  const routeBuses = state.vehicles.filter(v => String(v.routeId) === routeId);
+
+  const arrivals = routeBuses.map(bus => {
+    const busFracIdx = computeBusFractionalIndex(bus, routeStops);
+    if (busFracIdx === null) return { bus, stopsAway: null, stopsAwayFrac: null };
+
+    // Circular-route wraparound — reasonable for MIT loops, imperfect for
+    // EZRide's linear runs but still produces a usable number.
+    let stopsAwayFrac = stopIndex - busFracIdx;
+    if (stopsAwayFrac < 0) stopsAwayFrac += totalStops;
+
+    const stopsAway = Math.round(stopsAwayFrac);
+
+    return { bus, stopsAway, stopsAwayFrac };
+  }).sort((a, b) => (a.stopsAwayFrac ?? 999) - (b.stopsAwayFrac ?? 999));
+
+  return { stop, stopIndex, totalStops, routeName, arrivals };
+}
+
+/**
+ * Create popup content for a stop with bus distance info + pin button.
  */
 function createStopPopupContent(stopData) {
-  const { name, routeName, routeId, stopIndex, totalStops } = stopData;
-  
-  // Find buses on this route
-  const routeBuses = state.vehicles.filter(v => String(v.routeId) === routeId);
-  
+  const { name, routeName, routeId, stopIndex, totalStops, id: stopId } = stopData;
+
+  const info = computeStopArrivals(routeId, stopId);
+  const effectiveArrivals = info?.arrivals || [];
+
   let busInfo = '';
-  if (routeBuses.length === 0) {
+  if (effectiveArrivals.length === 0) {
     busInfo = '<p class="no-buses">No active buses on this route</p>';
   } else {
-    // Get the stops for this route to calculate distance
-    const routeStops = state.routeData?.stops[routeId] || [];
-    
-    const busDistances = routeBuses.map(bus => {
-      // Find which stop the bus is closest to
-      const busStopIndex = findClosestStopIndex(bus, routeStops);
-      
-      if (busStopIndex === -1) {
-        return { bus, stopsAway: null };
-      }
-      
-      // Calculate stops away (considering circular routes)
-      let stopsAway = stopIndex - busStopIndex;
-      if (stopsAway < 0) {
-        stopsAway += totalStops; // Wrap around for circular routes
-      }
-      
-      return { bus, stopsAway, busStopIndex };
-    });
-    
-    // Sort by stops away
-    busDistances.sort((a, b) => (a.stopsAway ?? 999) - (b.stopsAway ?? 999));
-    
     busInfo = '<div class="bus-distances">';
-    for (const { bus, stopsAway } of busDistances) {
+    for (const { bus, stopsAway } of effectiveArrivals) {
       const busLabel = bus.busNumber || bus.id;
       if (stopsAway === 0) {
         busInfo += `<p class="bus-here">🚌 Bus ${busLabel} is <strong>at this stop</strong></p>`;
@@ -283,7 +489,25 @@ function createStopPopupContent(stopData) {
     }
     busInfo += '</div>';
   }
-  
+
+  const pinnedHere = isStopPinned(routeId, stopId);
+  const somethingElsePinned = !pinnedHere && state.pinnedStop !== null;
+  let pinLabel;
+  if (pinnedHere) {
+    pinLabel = '📌 Unpin from top';
+  } else if (somethingElsePinned) {
+    pinLabel = '📌 Pin this stop instead';
+  } else {
+    pinLabel = '📌 Pin to top';
+  }
+  const pinBtn = `
+    <button class="pin-btn${pinnedHere ? ' pinned' : ''}"
+            data-pin-route="${routeId}"
+            data-pin-stop="${stopId}">
+      ${pinLabel}
+    </button>
+  `;
+
   return `
     <div class="popup-content stop-popup">
       <h3>🚏 ${name}</h3>
@@ -291,6 +515,7 @@ function createStopPopupContent(stopData) {
       <p class="stop-number">Stop ${stopIndex + 1} of ${totalStops}</p>
       <hr>
       ${busInfo}
+      ${pinBtn}
     </div>
   `;
 }
@@ -320,6 +545,165 @@ function findClosestStopIndex(bus, stops) {
   }
   
   return closestIndex;
+}
+
+/**
+ * The number of previous stops shown on the approach-line visualization.
+ * Buses farther out than this are listed as overflow text below the line.
+ */
+const PINNED_TRACK_WINDOW_STOPS = 6;
+
+/**
+ * Classify a bus's proximity to the pinned stop for UI styling.
+ * Returns one of: 'arriving' (0-1 stops), 'near' (2-3), or '' (further).
+ */
+function classifyBusProximity(stopsAway) {
+  if (stopsAway === null || stopsAway === undefined) return '';
+  if (stopsAway <= 1) return 'arriving';
+  if (stopsAway <= 3) return 'near';
+  return '';
+}
+
+/**
+ * Human-readable distance string for a bus arrival.
+ */
+function formatStopsAwayText(stopsAway) {
+  if (stopsAway === null || stopsAway === undefined) return '??';
+  if (stopsAway === 0) return 'here';
+  if (stopsAway === 1) return '1 stop';
+  return `${stopsAway} stops`;
+}
+
+/**
+ * Render a single bus marker as an HTML string for the approach-line.
+ * `labelPosition` is 'below' (even index) or 'above' (odd index) so adjacent
+ * bus labels don't overlap. The visible label is just the distance text —
+ * the bus ID lives in the tooltip for anyone who wants it.
+ */
+function renderTrackBusHTML(bus, stopsAway, stopsAwayFrac, labelPosition) {
+  const busLabel = bus.busNumber || bus.id;
+  const distanceText = formatStopsAwayText(stopsAway);
+  const proximity = classifyBusProximity(stopsAway);
+
+  // Position ratio within the 6-stop window. 0 = at the destination,
+  // 1 = at the leftmost visible stop. Values outside [0, 1] are clamped.
+  const rawRatio = stopsAwayFrac / PINNED_TRACK_WINDOW_STOPS;
+  const ratio = Math.min(Math.max(rawRatio, 0), 1).toFixed(3);
+
+  return `
+    <div class="track-bus ${proximity} label-${labelPosition}"
+         data-bus-id="${bus.id}"
+         style="--offset-ratio: ${ratio}"
+         title="Bus ${busLabel} — ${distanceText}">
+      <div class="track-bus-dot">🚌</div>
+      <div class="track-bus-label">${distanceText}</div>
+    </div>
+  `;
+}
+
+/**
+ * Render the single pinned-stop panel at the top of the app. Hides entirely
+ * when nothing is pinned. Visualizes buses approaching the pinned stop as
+ * markers on a horizontal line whose right end is the destination.
+ *
+ * Buses within 6 stops of the pinned stop render on the line at a fractional
+ * position derived from their actual geo coordinates. Buses further out are
+ * listed as a text strip below the line.
+ */
+function renderPinnedPanel() {
+  const panel = document.getElementById('pinned-panel');
+  if (!panel) return;
+
+  if (!state.pinnedStop) {
+    panel.classList.add('hidden');
+    panel.innerHTML = '';
+    return;
+  }
+
+  panel.classList.remove('hidden');
+
+  const { routeId, stopId } = state.pinnedStop;
+  const info = computeStopArrivals(routeId, stopId);
+  const routeInfo = state.routeData?.routeInfo[routeId] || {};
+  const routeColor = routeInfo.color || '#a31f34';
+  const chip = chipFor(routeId);
+
+  const stopName = info?.stop.name || 'Stop unavailable';
+  const subtitle = info
+    ? `${info.routeName} · Stop ${info.stopIndex + 1} of ${info.totalStops}`
+    : (routeInfo.name || 'Waiting for route data…');
+
+  // Split arrivals into track-visible (≤ 6 stops away) and overflow.
+  // A tiny 0.5-stop grace lets a bus that just crossed the boundary still
+  // render at the far-left of the line instead of abruptly jumping to text.
+  const visible = [];
+  const overflow = [];
+  for (const arr of info?.arrivals || []) {
+    if (arr.stopsAwayFrac === null || arr.stopsAwayFrac === undefined) {
+      overflow.push(arr);
+    } else if (arr.stopsAwayFrac <= PINNED_TRACK_WINDOW_STOPS + 0.5) {
+      visible.push(arr);
+    } else {
+      overflow.push(arr);
+    }
+  }
+
+  // Previous-stop dots at positions 1..WINDOW along the line (position 0
+  // is the destination itself, rendered as the big stop marker).
+  let prevDotsHtml = '';
+  for (let n = 1; n <= PINNED_TRACK_WINDOW_STOPS; n++) {
+    const ratio = (n / PINNED_TRACK_WINDOW_STOPS).toFixed(3);
+    prevDotsHtml += `<div class="track-prev-dot" style="--offset-ratio: ${ratio}"></div>`;
+  }
+
+  // Bus markers. Even-index buses get their labels below the line, odd-
+  // index above, so adjacent labels don't overlap.
+  let busesHtml = '';
+  visible.forEach(({ bus, stopsAway, stopsAwayFrac }, idx) => {
+    const labelPosition = idx % 2 === 0 ? 'below' : 'above';
+    busesHtml += renderTrackBusHTML(bus, stopsAway, stopsAwayFrac, labelPosition);
+  });
+
+  // Empty-state message when the track has no buses.
+  let emptyHtml = '';
+  if (visible.length === 0) {
+    const text = overflow.length === 0
+      ? 'No active buses on this route'
+      : 'No buses within the next 6 stops';
+    emptyHtml = `<div class="track-empty">${text}</div>`;
+  }
+
+  // Overflow text list for buses beyond the visible window.
+  let overflowHtml = '';
+  if (overflow.length > 0) {
+    const parts = overflow.map(({ stopsAway }) => {
+      return `<span class="overflow-item">${formatStopsAwayText(stopsAway)}</span>`;
+    });
+    overflowHtml = `<div class="pinned-overflow"><span class="overflow-prefix">Also approaching:</span> ${parts.join(' · ')}</div>`;
+  }
+
+  // Destination pulses when a bus is 0 or 1 stops away.
+  const anyArriving = visible.some(a => a.stopsAway === 0 || a.stopsAway === 1);
+  const trackClass = `pinned-track${anyArriving ? ' arriving' : ''}`;
+
+  panel.innerHTML = `
+    <div class="pinned-header" style="--pin-color: ${routeColor}">
+      <span class="provider-chip">${chip}</span>
+      <div class="pinned-title-group">
+        <div class="pinned-stop-name" title="${stopName}">${stopName}</div>
+        <div class="pinned-subtitle">${subtitle}</div>
+      </div>
+      <button class="unpin-btn" aria-label="Unpin">✕</button>
+    </div>
+    <div class="${trackClass}" style="--pin-color: ${routeColor}">
+      <div class="track-line"></div>
+      ${prevDotsHtml}
+      <div class="track-stop" title="${stopName}">🚏</div>
+      ${busesHtml}
+      ${emptyHtml}
+    </div>
+    ${overflowHtml}
+  `;
 }
 
 /**
@@ -516,6 +900,7 @@ async function updateData() {
 
     updateVehicleMarkers(state.vehicles);
     renderShuttleList(state.vehicles);
+    renderPinnedPanel();
 
     const now = new Date().toLocaleTimeString();
     if (errors.length > 0) {
@@ -658,19 +1043,57 @@ function initRefreshButton() {
 }
 
 /**
+ * Wire a single delegated click handler for pin/unpin buttons. Popup DOM
+ * is rebuilt by Leaflet on each open, so binding per-button would leak.
+ */
+function initPinDelegation() {
+  document.addEventListener('click', (e) => {
+    // Unpin button (✕) on the pinned-panel card has no routeId/stopId pair —
+    // it just clears whatever is pinned.
+    const unpinBtn = e.target.closest('.pinned-panel .unpin-btn');
+    if (unpinBtn) {
+      unpinStop();
+      return;
+    }
+
+    const btn = e.target.closest('[data-pin-route][data-pin-stop]');
+    if (!btn) return;
+
+    const routeId = btn.dataset.pinRoute;
+    const stopId = btn.dataset.pinStop;
+
+    if (isStopPinned(routeId, stopId)) {
+      unpinStop();
+    } else {
+      pinStop(routeId, stopId);
+    }
+
+    // Close any open Leaflet popup so the user immediately sees the
+    // panel update without a stale "Pin" button floating around.
+    if (state.map) state.map.closePopup();
+  });
+}
+
+/**
  * Initialize the application
  */
 async function init() {
   console.log('🚌 MIT Shuttle Tracker starting...');
-  
+
   // Initialize map
   initMap();
-  
+
   // Initialize mobile bottom sheet
   initMobileSheet();
-  
+
   // Initialize refresh button
   initRefreshButton();
+
+  // Wire delegated click handler for pin/unpin buttons
+  initPinDelegation();
+
+  // Load the persisted pinned stop (or default to Grad Junction West on first visit)
+  state.pinnedStop = loadPinnedStop();
   
   try {
     // Fetch initial data from every configured system in parallel
