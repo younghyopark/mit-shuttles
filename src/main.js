@@ -3,7 +3,11 @@
  */
 
 import L from 'leaflet';
-import { fetchRoutes, fetchVehicles, fetchRouteData } from './api.js';
+import {
+  fetchAllRoutesAndData,
+  fetchAllVehicles,
+  SYSTEMS,
+} from './api.js';
 
 // MIT Campus center coordinates
 const MIT_CENTER = [42.3601, -71.0942];
@@ -64,18 +68,36 @@ function saveRouteDisplayPrefs() {
 }
 
 /**
- * Load route display preferences from localStorage
+ * Load route display preferences from localStorage.
+ * Migrates legacy unprefixed keys (pre-EZRide) to the `mit:` prefix.
  */
 function loadRouteDisplayPrefs() {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) {
-      return JSON.parse(saved);
+      const parsed = JSON.parse(saved);
+      // One-shot migration: turn "63220" → "mit:63220".
+      for (const key of Object.keys(parsed)) {
+        if (!key.includes(':')) {
+          parsed[`mit:${key}`] = parsed[key];
+          delete parsed[key];
+        }
+      }
+      return parsed;
     }
   } catch (e) {
     console.warn('Could not load route preferences:', e);
   }
   return {};
+}
+
+/**
+ * Return the 2-3 letter provider chip for a prefixed route ID.
+ * 'mit:63220' -> 'MIT', 'ezride:67265' -> 'EZR'.
+ */
+function chipFor(prefixedRouteId) {
+  const systemKey = String(prefixedRouteId).split(':')[0];
+  return SYSTEMS[systemKey]?.chip || '';
 }
 
 /**
@@ -395,18 +417,17 @@ function renderShuttleList(vehicles) {
  */
 function renderRouteFilters() {
   const container = document.getElementById('route-filters');
-  
-  // Filter out service routes
-  const activeRoutes = state.routes.filter(r => 
-    !r.name.includes('OOS') && !r.name.includes('Charter')
-  );
-  
-  const routesHtml = activeRoutes.map(route => {
+
+  // api.js already filters OOS / Charter / outdated routes at the source,
+  // so state.routes is the display set.
+  const routesHtml = state.routes.map(route => {
     const routeIdStr = String(route.myid);
     const isShowing = state.routeDisplay.get(routeIdStr) === true;
+    const chip = chipFor(routeIdStr);
     return `
       <div class="route-filter ${isShowing ? 'active' : ''}">
         <button class="route-toggle-btn" data-route-id="${routeIdStr}" title="Show/hide route path and stops">
+          <span class="provider-chip">${chip}</span>
           <span class="route-color" style="background: ${route.color}"></span>
           <span class="route-name">${route.name}</span>
           <span class="route-toggle-icon">${isShowing ? '🗺️' : '○'}</span>
@@ -452,20 +473,26 @@ function updateStatus(connected, message) {
 }
 
 /**
- * Fetch and update all data
+ * Fetch and update all data.
+ * Pulls vehicles from every configured system in parallel; tolerates
+ * one system failing without blanking the UI.
  */
 async function updateData() {
   try {
-    // Fetch vehicles
-    state.vehicles = await fetchVehicles();
-    
-    // Update UI - show all vehicles
+    const { vehicles, errors } = await fetchAllVehicles();
+    state.vehicles = vehicles;
+
     updateVehicleMarkers(state.vehicles);
     renderShuttleList(state.vehicles);
-    
+
     const now = new Date().toLocaleTimeString();
-    updateStatus(true, `Updated: ${now} • ${state.vehicles.length} shuttles`);
-    
+    if (errors.length > 0) {
+      const failed = errors.map(e => SYSTEMS[e.systemKey]?.label || e.systemKey).join(', ');
+      console.warn('Partial update failures:', errors);
+      updateStatus(true, `Updated: ${now} • ${state.vehicles.length} shuttles • ${failed} unavailable`);
+    } else {
+      updateStatus(true, `Updated: ${now} • ${state.vehicles.length} shuttles`);
+    }
   } catch (error) {
     console.error('Update error:', error);
     updateStatus(false, 'Connection error - retrying...');
@@ -614,36 +641,47 @@ async function init() {
   initRefreshButton();
   
   try {
-    // Fetch initial data
+    // Fetch initial data from every configured system in parallel
     updateStatus(false, 'Loading routes...');
-    state.routes = await fetchRoutes();
-    
-    // Load saved route display preferences
+    const { routes, routeData, errors } = await fetchAllRoutesAndData();
+
+    // If everything failed, treat it as a fatal init error
+    if (routes.length === 0 && Object.keys(routeData.routeInfo).length === 0) {
+      throw new Error('All transit systems failed to load');
+    }
+
+    state.routes = routes;
+    state.routeData = routeData;
+
+    if (errors.length > 0) {
+      const failed = errors.map(e => SYSTEMS[e.systemKey]?.label || e.systemKey);
+      const uniqueFailed = [...new Set(failed)].join(', ');
+      console.warn(`Partial load: ${uniqueFailed} unavailable`, errors);
+      updateStatus(false, `${uniqueFailed} unavailable - loading others...`);
+    }
+
+    // Load saved route display preferences (auto-migrates legacy unprefixed keys)
     const savedPrefs = loadRouteDisplayPrefs();
-    
+
     // Initialize route display from saved prefs or default to hidden
     state.routes.forEach(route => {
       const routeId = String(route.myid);
       state.routeDisplay.set(routeId, savedPrefs[routeId] === true);
     });
-    
-    // Fetch route paths and stops
-    updateStatus(false, 'Loading route data...');
-    state.routeData = await fetchRouteData();
-    
+
     renderRouteFilters();
-    
+
     // Draw route lines and stops
     updateRouteDisplay();
-    
+
     // Initial vehicle update
     await updateData();
-    
+
     // Start periodic updates
     state.updateTimer = setInterval(updateData, UPDATE_INTERVAL);
-    
+
     console.log('✅ MIT Shuttle Tracker initialized');
-    
+
   } catch (error) {
     console.error('Initialization error:', error);
     updateStatus(false, 'Failed to load - check console');
