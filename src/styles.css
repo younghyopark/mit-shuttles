@@ -224,11 +224,15 @@ body {
   right: 18px;
   top: 31px;
   height: 2px;
+  /* Gradient peaks at the pinned slot (just left of far right) and softens
+     toward both ends. Using pinned-slot-ratio here keeps the visual focus
+     on the pinned stop even though it's no longer the rightmost point. */
   background: linear-gradient(
     to right,
     rgba(255, 255, 255, 0.06) 0%,
     rgba(255, 255, 255, 0.22) 20%,
-    var(--pin-color, var(--primary)) 100%
+    var(--pin-color, var(--primary)) calc((1 - var(--pinned-slot-ratio, 0)) * 100%),
+    rgba(255, 255, 255, 0.28) 100%
   );
 }
 
@@ -252,7 +256,10 @@ body {
    there's always a visible segment of bar peeking out above and below. */
 .track-stop {
   position: absolute;
-  right: 18px;
+  /* The bar sits one stop-slot to the left of the far right edge so the
+     "next stop" dot can live at the far right. Same calc pattern as the
+     bus markers — keep them in sync with the bus ratio formula. */
+  right: calc(18px + var(--pinned-slot-ratio, 0) * (100% - 36px));
   top: 6px;
   transform: translateX(50%);
   width: 4px;
@@ -1000,6 +1007,62 @@ body {
 .pin-picker-clear .pin-picker-row-label {
   color: #ef4444;
   font-weight: 600;
+}
+
+/* Section header inside the picker body (e.g. "Display") */
+.pin-picker-section-header {
+  font-size: 0.66rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding: 0.55rem 1rem 0.3rem;
+}
+
+.pin-picker-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 0.25rem 0;
+}
+
+/* Settings row (e.g. display toggle) — no chevron, toggle at the right */
+.pin-picker-settings-row {
+  border-bottom: none;
+}
+
+.pin-picker-settings-row .pin-picker-row-label {
+  font-size: 0.88rem;
+}
+
+/* iOS-style toggle switch used for display prefs */
+.pin-picker-switch {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.14);
+  flex-shrink: 0;
+  transition: background 0.18s ease;
+}
+
+.pin-picker-switch.on {
+  background: var(--primary);
+}
+
+.pin-picker-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  transition: transform 0.18s ease;
+}
+
+.pin-picker-switch.on .pin-picker-switch-thumb {
+  transform: translateX(16px);
 }
 
 .pin-picker-empty {

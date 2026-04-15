@@ -24,6 +24,9 @@ const PINNED_STOP_KEY = 'mit-shuttle-pinned-stop';
 // Legacy plural key for migration from the multi-pin model
 const LEGACY_PINNED_STOPS_KEY = 'mit-shuttle-pinned-stops';
 
+// LocalStorage key for display preferences (showNextStop, etc.)
+const DISPLAY_PREFS_KEY = 'mit-shuttle-display-prefs';
+
 // Default focused route for first-time visitors: Tech Shuttle.
 const DEFAULT_FOCUSED_ROUTE_ID = 'mit:63220';
 
@@ -42,6 +45,7 @@ const state = {
   stopMarkers: new Map(),     // Stop markers grouped by route
   routeData: null,            // Route points and stops data
   pinnedStop: null,           // Single { routeId, stopId } or null
+  displayPrefs: { showNextStop: true }, // User display preferences (persisted)
   lastBusFrac: new Map(),     // `${routeId}:${busId}` -> { frac, time } for smoothing
   updateTimer: null
 };
@@ -159,6 +163,29 @@ function loadPinnedStop() {
   } catch (e) {
     console.warn('Could not load pinned stop:', e);
     return null;
+  }
+}
+
+/**
+ * Load display preferences (toggles controlling how the pinned panel renders).
+ * Merges saved values over sensible defaults so new keys auto-populate.
+ */
+function loadDisplayPrefs() {
+  const defaults = { showNextStop: true };
+  try {
+    const saved = localStorage.getItem(DISPLAY_PREFS_KEY);
+    if (saved) return { ...defaults, ...JSON.parse(saved) };
+  } catch (e) {
+    console.warn('Could not load display prefs:', e);
+  }
+  return defaults;
+}
+
+function saveDisplayPrefs() {
+  try {
+    localStorage.setItem(DISPLAY_PREFS_KEY, JSON.stringify(state.displayPrefs));
+  } catch (e) {
+    console.warn('Could not save display prefs:', e);
   }
 }
 
@@ -574,10 +601,76 @@ function createStopPopupContent(stopData) {
 }
 
 /**
- * The number of previous stops shown on the approach-line visualization.
- * Buses farther out than this are listed as overflow text below the line.
+ * Approach-line layout: how many stops show on each side of the pinned one.
+ *
+ *  ┌──────────────────────────────────────────────┐
+ *  │  [6] [5] [4] [3] [2] [1] [PINNED] [next]     │
+ *  │                             │                │
+ *  │                             bar sits here    │
+ *  └──────────────────────────────────────────────┘
+ *
+ * The "next" slot is toggleable via state.displayPrefs.showNextStop:
+ *  - true:  pinned stop sits one slot left of the far right edge, with the
+ *           stop AFTER pinned at the far right. Useful for seeing "just
+ *           departed" buses and grounding the pinned stop in its sequence.
+ *  - false: pinned stop sits at the far right (classic layout), 6 previous
+ *           stops fill the track.
  */
-const PINNED_TRACK_WINDOW_STOPS = 6;
+const PINNED_TRACK_PREV_STOPS = 6;
+
+/**
+ * Compute the current layout based on display prefs. Called every render.
+ */
+function pinnedTrackLayout() {
+  const next = state.displayPrefs?.showNextStop ? 1 : 0;
+  const prev = PINNED_TRACK_PREV_STOPS;
+  const span = prev + next;
+  return {
+    prev,
+    next,
+    span,
+    slotRatio: span === 0 ? 0 : next / span,
+  };
+}
+
+/**
+ * Map a bus's "stops until pinned" distance onto a visible track position
+ * in [0, PINNED_TRACK_SPAN], or null if it's outside the window.
+ *
+ * Two branches:
+ *  - approaching pinned: stopsAwayFrac ∈ [0, PINNED_TRACK_PREV_STOPS + 0.5]
+ *                        maps to [PINNED_TRACK_NEXT_STOPS, PINNED_TRACK_SPAN]
+ *  - just departed pinned (bus moved past pinned toward the next stop):
+ *                        stopsAwayFrac ∈ [totalStops - 1, totalStops]
+ *                        maps to [0, 1]
+ *
+ * The 0.5 grace on the approaching tail keeps a bus that just crossed the
+ * 6-stop boundary rendering at the far-left slot instead of abruptly
+ * vanishing into overflow.
+ */
+function trackPosFromStopsAway(stopsAwayFrac, totalStops) {
+  if (stopsAwayFrac === null || stopsAwayFrac === undefined) return null;
+  if (!(totalStops > 0)) return null;
+
+  const layout = pinnedTrackLayout();
+
+  // Approaching pinned (integer or fractional, 0..PREV_STOPS).
+  if (stopsAwayFrac >= 0 && stopsAwayFrac <= layout.prev + 0.5) {
+    return Math.min(layout.next + stopsAwayFrac, layout.span);
+  }
+
+  // Just departed pinned and heading toward the next stop. Only meaningful
+  // when layout.next > 0 — in classic mode this region collapses and buses
+  // in it are treated as overflow.
+  if (layout.next > 0) {
+    const departureStart = totalStops - layout.next;
+    if (stopsAwayFrac >= departureStart && stopsAwayFrac <= totalStops) {
+      return stopsAwayFrac - departureStart;
+    }
+  }
+
+  return null;
+}
 
 /**
  * Classify a bus's proximity to the pinned stop for UI styling.
@@ -591,7 +684,8 @@ function classifyBusProximity(stopsAway) {
 }
 
 /**
- * Human-readable distance string for a bus arrival.
+ * Human-readable distance string for a bus arrival (integer stops from pinned,
+ * approaching direction only). Used for overflow text and popups.
  */
 function formatStopsAwayText(stopsAway) {
   if (stopsAway === null || stopsAway === undefined) return '??';
@@ -601,28 +695,48 @@ function formatStopsAwayText(stopsAway) {
 }
 
 /**
+ * Label text for a bus on the approach-line track, derived from its visible
+ * position. Handles both sides of the pinned stop: "here", "N stops" on the
+ * approaching side, and "leaving" / "next stop" on the departing side.
+ */
+function labelForTrackPos(trackPos) {
+  if (trackPos === null || trackPos === undefined) return '??';
+  const layout = pinnedTrackLayout();
+
+  // Departing region: 0 (at the next stop) up to the pinned slot (layout.next).
+  // Collapses to zero width in classic mode (layout.next === 0).
+  if (trackPos < layout.next) {
+    if (trackPos <= 0.15) return 'next stop';
+    return 'leaving';
+  }
+  // Approaching region: pinned at layout.next, previous stops beyond.
+  const stopsFromPinned = Math.round(trackPos - layout.next);
+  if (stopsFromPinned === 0) return 'here';
+  if (stopsFromPinned === 1) return '1 stop';
+  return `${stopsFromPinned} stops`;
+}
+
+/**
  * Render a single bus marker as an HTML string for the approach-line.
  * `labelPosition` is 'below' (even index) or 'above' (odd index) so adjacent
  * bus labels don't overlap. The visible label is just the distance text —
  * the bus ID lives in the tooltip for anyone who wants it.
  */
-function renderTrackBusHTML(bus, stopsAway, stopsAwayFrac, labelPosition) {
+function renderTrackBusHTML(bus, labelText, trackPos, proximity, labelPosition) {
   const busLabel = bus.busNumber || bus.id;
-  const distanceText = formatStopsAwayText(stopsAway);
-  const proximity = classifyBusProximity(stopsAway);
+  const { span } = pinnedTrackLayout();
 
-  // Position ratio within the 6-stop window. 0 = at the destination,
-  // 1 = at the leftmost visible stop. Values outside [0, 1] are clamped.
-  const rawRatio = stopsAwayFrac / PINNED_TRACK_WINDOW_STOPS;
+  // Ratio across the track: 0 = far right, 1 = far left (6 prev stops).
+  const rawRatio = span > 0 ? trackPos / span : 0;
   const ratio = Math.min(Math.max(rawRatio, 0), 1).toFixed(3);
 
   return `
     <div class="track-bus ${proximity} label-${labelPosition}"
          data-bus-id="${bus.id}"
          style="--offset-ratio: ${ratio}"
-         title="Bus ${busLabel} — ${distanceText}">
+         title="Bus ${busLabel} — ${labelText}">
       <div class="track-bus-dot">🚌</div>
-      <div class="track-bus-label">${distanceText}</div>
+      <div class="track-bus-label">${labelText}</div>
     </div>
   `;
 }
@@ -659,35 +773,46 @@ function renderPinnedPanel() {
     ? `${info.routeName} · Stop ${info.stopIndex + 1} of ${info.totalStops}`
     : (routeInfo.name || 'Waiting for route data…');
 
-  // Split arrivals into track-visible (≤ 6 stops away) and overflow.
-  // A tiny 0.5-stop grace lets a bus that just crossed the boundary still
-  // render at the far-left of the line instead of abruptly jumping to text.
+  // Partition each arrival into visible (has a track position) vs overflow
+  // (listed as text below the line). Track position already encodes both
+  // the approaching side and the "just departed" side relative to pinned.
+  const totalStops = info?.totalStops || 0;
   const visible = [];
   const overflow = [];
   for (const arr of info?.arrivals || []) {
-    if (arr.stopsAwayFrac === null || arr.stopsAwayFrac === undefined) {
+    const trackPos = trackPosFromStopsAway(arr.stopsAwayFrac, totalStops);
+    if (trackPos === null) {
       overflow.push(arr);
-    } else if (arr.stopsAwayFrac <= PINNED_TRACK_WINDOW_STOPS + 0.5) {
-      visible.push(arr);
     } else {
-      overflow.push(arr);
+      visible.push({ ...arr, trackPos });
     }
   }
 
-  // Previous-stop dots at positions 1..WINDOW along the line (position 0
-  // is the destination itself, rendered as the big stop marker).
+  // Draw buses rightmost-first so label alternation (below/above) follows
+  // physical left-to-right adjacency on the track.
+  visible.sort((a, b) => a.trackPos - b.trackPos);
+
+  // Stop dots for every integer slot along the track, skipping the slot
+  // where the vertical bar (pinned stop) sits. The "next stop" dot (when
+  // enabled) lives at position 0 (far right) so the pinned slot reads as
+  // a point in a sequence rather than a dead-end.
+  const layout = pinnedTrackLayout();
   let prevDotsHtml = '';
-  for (let n = 1; n <= PINNED_TRACK_WINDOW_STOPS; n++) {
-    const ratio = (n / PINNED_TRACK_WINDOW_STOPS).toFixed(3);
+  for (let n = 0; n <= layout.span; n++) {
+    if (n === layout.next) continue;
+    const ratio = (n / layout.span).toFixed(3);
     prevDotsHtml += `<div class="track-prev-dot" style="--offset-ratio: ${ratio}"></div>`;
   }
 
-  // Bus markers. Even-index buses get their labels below the line, odd-
-  // index above, so adjacent labels don't overlap.
+  // Bus markers. Labels alternate below/above so adjacent labels don't
+  // collide. The label text comes from trackPos (so the "just departed"
+  // region gets "leaving" / "next stop" instead of misleading big numbers).
   let busesHtml = '';
-  visible.forEach(({ bus, stopsAway, stopsAwayFrac }, idx) => {
+  visible.forEach(({ bus, stopsAway, trackPos }, idx) => {
     const labelPosition = idx % 2 === 0 ? 'below' : 'above';
-    busesHtml += renderTrackBusHTML(bus, stopsAway, stopsAwayFrac, labelPosition);
+    const labelText = labelForTrackPos(trackPos);
+    const proximity = classifyBusProximity(stopsAway);
+    busesHtml += renderTrackBusHTML(bus, labelText, trackPos, proximity, labelPosition);
   });
 
   // Single aggregate marker for every bus beyond the 6-stop window,
@@ -745,7 +870,7 @@ function renderPinnedPanel() {
         </svg>
       </button>
     </div>
-    <div class="${trackClass}" style="--pin-color: ${routeColor}">
+    <div class="${trackClass}" style="--pin-color: ${routeColor}; --pinned-slot-ratio: ${layout.slotRatio.toFixed(4)}">
       <div class="track-line"></div>
       ${prevDotsHtml}
       <div class="track-stop" title="${stopName}"></div>
@@ -1214,6 +1339,19 @@ function renderPinPickerRoutes() {
 
   let html = '';
 
+  // Display-options toggle: show one stop past the pinned slot on the track.
+  const showNext = !!state.displayPrefs?.showNextStop;
+  html += `
+    <div class="pin-picker-section-header">Display</div>
+    <button class="pin-picker-row pin-picker-settings-row" data-pp-action="toggle-next-stop" aria-pressed="${showNext}">
+      <span class="pin-picker-row-label">Show next stop on track</span>
+      <span class="pin-picker-switch${showNext ? ' on' : ''}" aria-hidden="true">
+        <span class="pin-picker-switch-thumb"></span>
+      </span>
+    </button>
+    <div class="pin-picker-divider"></div>
+  `;
+
   if (state.pinnedStop) {
     html += `
       <button class="pin-picker-row pin-picker-clear" data-pp-action="clear">
@@ -1341,6 +1479,18 @@ function initPinPicker() {
     const row = e.target.closest('.pin-picker-row');
     if (!row) return;
 
+    // Display-options: flip the "show next stop" switch, persist, and
+    // re-render both the picker (to flip the visual toggle) and the
+    // pinned panel (to pick up the new layout immediately).
+    if (row.dataset.ppAction === 'toggle-next-stop') {
+      if (!state.displayPrefs) state.displayPrefs = {};
+      state.displayPrefs.showNextStop = !state.displayPrefs.showNextStop;
+      saveDisplayPrefs();
+      renderPinPickerRoutes();
+      renderPinnedPanel();
+      return;
+    }
+
     if (row.dataset.ppAction === 'clear') {
       unpinStop();
       closePinPicker();
@@ -1415,6 +1565,7 @@ async function init() {
 
   // Load the persisted pinned stop (or default to Grad Junction West on first visit)
   state.pinnedStop = loadPinnedStop();
+  state.displayPrefs = loadDisplayPrefs();
   
   try {
     // Fetch initial data from every configured system in parallel
