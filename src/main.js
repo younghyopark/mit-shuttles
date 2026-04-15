@@ -90,7 +90,18 @@ function initMap() {
   state.map = L.map('map', {
     center: MIT_CENTER,
     zoom: DEFAULT_ZOOM,
-    zoomControl: true
+    zoomControl: true,
+    // zoomSnap controls how Leaflet rounds zoom levels. The default is
+    // 1 (integer-only), which means fitBounds has to pick the NEAREST
+    // integer zoom that fits the whole bounds — even if the actual
+    // best-fit is zoom 14.7, it rounds down to 14 and wastes pixels.
+    // Setting this to 0.25 lets fitBounds pick quarter-integer zooms
+    // (14.25, 14.5, 14.75, ...), which tightens the initial fit a lot
+    // on mobile viewports where the route is landscape and the screen
+    // is portrait. Manual zoom button clicks still snap to the nearest
+    // integer via zoomDelta.
+    zoomSnap: 0.25,
+    zoomDelta: 1,
   });
 
   // Add dark tile layer
@@ -1690,41 +1701,48 @@ function computeVisibleRouteBounds() {
 function fitMapToVisibleRoutes({ animate = true } = {}) {
   if (!state.map) return;
 
-  // Make sure Leaflet's idea of the container size is current. The
-  // pinned panel can show/hide between renders, which changes the
-  // map container's box without Leaflet knowing about it.
+  // Make sure Leaflet's idea of the container size is current. Route
+  // toggles and pin/unpin actions can resize the map via normal DOM
+  // layout without Leaflet noticing until we tell it to re-measure.
   state.map.invalidateSize({ animate: false, pan: false });
 
   const bounds = computeVisibleRouteBounds();
   if (!bounds || !bounds.isValid()) return;
 
-  // Measure overlays so we can pad around them. offsetHeight returns 0
-  // for hidden elements, so the hidden-state case handles itself.
-  const pinnedPanel = document.getElementById('pinned-panel');
-  const pinnedHeight = pinnedPanel && !pinnedPanel.classList.contains('hidden')
-    ? pinnedPanel.offsetHeight
-    : 0;
-
-  // On mobile the sidebar is a bottom sheet that overlays the bottom
-  // of the map. In its collapsed state only the handle is visible —
-  // ~70px per initMobileSheet. On desktop the sidebar is a sibling
-  // of the map, not an overlay, so no bottom reserve is needed.
+  // IMPORTANT — overlay vs sibling distinction:
+  //
+  // The pinned panel (#pinned-panel) is a DOM sibling of <main> in the
+  // app flex column, not an overlay. When it's visible, the map
+  // container's offsetHeight is ALREADY shorter — Leaflet sees the
+  // correct size after invalidateSize above. We must NOT pad again for
+  // it, or we'd double-count and cut available map pixels in half.
+  //
+  // The mobile sidebar (#sidebar) IS an overlay — on phone widths it's
+  // position:absolute and the map container extends behind it. So we
+  // DO need to reserve bottom padding equal to however much of the
+  // sheet is visible (the collapsed handle area, typically ~80px).
+  //
+  // This asymmetry is why the padding numbers aren't symmetric: top
+  // gets only breathing room, bottom gets breathing room plus the
+  // sheet reserve.
   const isMobile = window.innerWidth <= 768;
   const sidebar = document.getElementById('sidebar');
   const sheetCollapsed = sidebar?.classList.contains('collapsed');
+  // Collapsed handle is ~80px tall on mobile; expanded sheet covers a
+  // much larger area but we cap at 260px so the fit still has some
+  // headroom to show content in landscape orientation.
   const bottomReserve = isMobile
     ? (sheetCollapsed ? 80 : Math.min(sidebar?.offsetHeight ?? 0, 260))
     : 0;
 
+  const BREATHING_ROOM = 18;
+
   state.map.fitBounds(bounds, {
-    // paddingTopLeft / paddingBottomRight let us pad the top more than
-    // the bottom (to clear the pinned panel) without cropping the route
-    // unnecessarily on either side.
-    paddingTopLeft:    [24, pinnedHeight + 24],
-    paddingBottomRight:[24, bottomReserve + 24],
+    paddingTopLeft:    [BREATHING_ROOM, BREATHING_ROOM],
+    paddingBottomRight:[BREATHING_ROOM, BREATHING_ROOM + bottomReserve],
     // Clamp how far Leaflet is willing to zoom IN. Without this, a
-    // small route (just a couple close stops) would zoom to street
-    // level and lose all context.
+    // very small route (e.g. two very close stops) would zoom to
+    // street level and lose all context.
     maxZoom: 17,
     animate,
   });
