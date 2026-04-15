@@ -19,6 +19,11 @@ const UPDATE_INTERVAL = 5000;
 // LocalStorage key for route display preferences
 const STORAGE_KEY = 'mit-shuttle-route-display';
 
+// Default focused route for first-time visitors: Tech Shuttle.
+// If a user has never toggled any route, we auto-enable this one so the
+// map isn't a blank slate and the user immediately sees something useful.
+const DEFAULT_FOCUSED_ROUTE_ID = 'mit:63220';
+
 // Application state
 const state = {
   map: null,
@@ -69,26 +74,32 @@ function saveRouteDisplayPrefs() {
 
 /**
  * Load route display preferences from localStorage.
- * Migrates legacy unprefixed keys (pre-EZRide) to the `mit:` prefix.
+ * - First-time visitors (no saved state) get Tech Shuttle focused by default.
+ * - Migrates legacy unprefixed keys (pre-EZRide) to the `mit:` prefix.
  */
 function loadRouteDisplayPrefs() {
+  const saved = localStorage.getItem(STORAGE_KEY);
+
+  // First-time visitor: seed with Tech Shuttle focused so the user sees
+  // a route drawn immediately instead of a blank map.
+  if (saved === null) {
+    return { [DEFAULT_FOCUSED_ROUTE_ID]: true };
+  }
+
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      // One-shot migration: turn "63220" → "mit:63220".
-      for (const key of Object.keys(parsed)) {
-        if (!key.includes(':')) {
-          parsed[`mit:${key}`] = parsed[key];
-          delete parsed[key];
-        }
+    const parsed = JSON.parse(saved);
+    // One-shot migration: turn "63220" → "mit:63220".
+    for (const key of Object.keys(parsed)) {
+      if (!key.includes(':')) {
+        parsed[`mit:${key}`] = parsed[key];
+        delete parsed[key];
       }
-      return parsed;
     }
+    return parsed;
   } catch (e) {
     console.warn('Could not load route preferences:', e);
+    return {};
   }
-  return {};
 }
 
 /**
@@ -101,13 +112,15 @@ function chipFor(prefixedRouteId) {
 }
 
 /**
- * Create a custom bus marker icon with direction arrow
+ * Create a custom bus marker icon with direction arrow.
+ * When `tinted` is true, the marker is rendered dimmed/desaturated to
+ * signal it belongs to a route the user isn't currently focused on.
  */
-function createBusIcon(color = '#a31f34', heading = 0) {
+function createBusIcon(color = '#a31f34', heading = 0, tinted = false) {
   return L.divIcon({
     className: 'bus-marker-container',
     html: `
-      <div class="bus-marker-wrapper">
+      <div class="bus-marker-wrapper${tinted ? ' tinted' : ''}">
         <div class="bus-direction-arrow" style="transform: rotate(${heading}deg); border-bottom-color: ${color}"></div>
         <div class="bus-marker" style="background: ${color}">
           🚌
@@ -310,11 +323,28 @@ function findClosestStopIndex(bus, stops) {
 }
 
 /**
- * Update route and stop visibility
+ * Update route and stop visibility. Also re-renders vehicle markers
+ * and the shuttle list so bus tinting tracks the focus state immediately
+ * when the user toggles a route on or off.
  */
 function updateRouteDisplay() {
   drawRouteLines();
   drawStopMarkers();
+  // Re-apply tinting: buses on freshly-focused routes un-tint, and buses
+  // on freshly-unfocused routes dim.
+  if (state.vehicles.length > 0) {
+    updateVehicleMarkers(state.vehicles);
+    renderShuttleList(state.vehicles);
+  }
+}
+
+/**
+ * A vehicle is "focused" when its route is currently toggled on. Buses on
+ * non-focused routes are rendered tinted so the user's current selection
+ * stands out visually.
+ */
+function isVehicleFocused(vehicle) {
+  return state.routeDisplay.get(String(vehicle.routeId)) === true;
 }
 
 /**
@@ -322,7 +352,7 @@ function updateRouteDisplay() {
  */
 function updateVehicleMarkers(vehicles) {
   const currentIds = new Set(vehicles.map(v => v.id));
-  
+
   // Remove markers for vehicles no longer active
   for (const [id, marker] of state.markers) {
     if (!currentIds.has(id)) {
@@ -330,13 +360,14 @@ function updateVehicleMarkers(vehicles) {
       state.markers.delete(id);
     }
   }
-  
+
   // Update or create markers
   for (const vehicle of vehicles) {
     // Use route info from vehicle data (API provides it directly)
     const routeColor = vehicle.routeColor || '#a31f34';
     const routeName = vehicle.routeName || 'Unknown Route';
-    
+    const tinted = !isVehicleFocused(vehicle);
+
     const popupContent = `
       <div class="popup-content">
         <h3>Bus #${vehicle.busNumber}</h3>
@@ -345,19 +376,19 @@ function updateVehicleMarkers(vehicles) {
         <p><strong>Last Update:</strong> ${vehicle.lastUpdate}</p>
       </div>
     `;
-    
+
     if (state.markers.has(vehicle.id)) {
       // Update existing marker
       const marker = state.markers.get(vehicle.id);
       marker.setLatLng([vehicle.latitude, vehicle.longitude]);
-      marker.setIcon(createBusIcon(routeColor, vehicle.heading));
+      marker.setIcon(createBusIcon(routeColor, vehicle.heading, tinted));
       marker.getPopup().setContent(popupContent);
     } else {
       // Create new marker
       const marker = L.marker([vehicle.latitude, vehicle.longitude], {
-        icon: createBusIcon(routeColor, vehicle.heading)
+        icon: createBusIcon(routeColor, vehicle.heading, tinted)
       }).addTo(state.map);
-      
+
       marker.bindPopup(popupContent);
       state.markers.set(vehicle.id, marker);
     }
@@ -383,9 +414,10 @@ function renderShuttleList(vehicles) {
     const routeName = vehicle.routeName || 'Unknown Route';
     const routeColor = vehicle.routeColor || '#a31f34';
     const loadPercent = vehicle.capacity > 0 ? Math.round((vehicle.passengers / vehicle.capacity) * 100) : 0;
-    
+    const tintedClass = isVehicleFocused(vehicle) ? '' : ' tinted';
+
     return `
-      <div class="shuttle-card" style="--route-color: ${routeColor}" data-vehicle-id="${vehicle.id}">
+      <div class="shuttle-card${tintedClass}" style="--route-color: ${routeColor}" data-vehicle-id="${vehicle.id}">
         <div class="bus-number">Bus #${vehicle.busNumber}</div>
         <div class="route-name">${routeName}</div>
         <div class="details">

@@ -189,6 +189,17 @@ body {
   border-left: 3px solid var(--route-color, var(--primary));
 }
 
+/* Shuttle cards for buses on non-focused routes are dimmed to match
+   the map-marker tinting. */
+.shuttle-card.tinted {
+  opacity: 0.45;
+  filter: saturate(0.5);
+}
+
+.shuttle-card.tinted:hover {
+  opacity: 0.8;
+}
+
 .shuttle-card:hover {
   background: rgba(255, 255, 255, 0.1);
 }
@@ -325,6 +336,14 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: opacity 0.25s ease, filter 0.25s ease;
+}
+
+/* Buses whose route is not currently toggled on render dimmed/desaturated
+   so the routes the user is focused on stand out visually. */
+.bus-marker-wrapper.tinted {
+  opacity: 0.35;
+  filter: saturate(0.3);
 }
 
 .bus-direction-arrow {
