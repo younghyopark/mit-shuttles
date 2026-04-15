@@ -61,18 +61,21 @@ async function apiRequest(endpoint, params) {
 }
 
 /**
- * Decide whether a raw route from the API should be shown in the UI.
- * Filters: OOS / Charter (MIT), and any route marked outdated (both systems).
+ * Decide whether a raw route from the API should be shown in the UI at all.
+ * Only drops the never-user-facing operator routes (OOS / Charter). Routes
+ * marked `outdated: "1"` (not currently running) are kept so the picker can
+ * still surface them under a "Not running now" section.
  */
 function shouldShowRoute(rawRoute) {
   if (!rawRoute || !rawRoute.name) return false;
   if (rawRoute.name.includes('OOS') || rawRoute.name.includes('Charter')) return false;
-  if (String(rawRoute.outdated) === '1') return false;
   return true;
 }
 
 /**
  * Fetch all routes for a single system, prefixed with the system key.
+ * Each route carries an `active` boolean (true = currently running, false =
+ * Passio marked it `outdated: "1"`). The UI decides how to display them.
  */
 export async function fetchRoutes(systemKey) {
   const system = SYSTEMS[systemKey];
@@ -91,6 +94,7 @@ export async function fetchRoutes(systemKey) {
       myid: prefixRouteId(systemKey, route.myid),
       _rawMyid: String(route.myid),
       systemKey,
+      active: String(route.outdated) !== '1',
     }));
 }
 

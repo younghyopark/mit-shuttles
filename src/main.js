@@ -738,7 +738,12 @@ function renderPinnedPanel() {
         <div class="pinned-stop-name" title="${stopName}">${stopName}</div>
         <div class="pinned-subtitle">${subtitle}</div>
       </div>
-      <button class="unpin-btn" aria-label="Unpin">✕</button>
+      <button class="edit-pin-btn" aria-label="Change pinned stop">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+        </svg>
+      </button>
     </div>
     <div class="${trackClass}" style="--pin-color: ${routeColor}">
       <div class="track-line"></div>
@@ -879,9 +884,10 @@ function renderShuttleList(vehicles) {
 function renderRouteFilters() {
   const container = document.getElementById('route-filters');
 
-  // api.js already filters OOS / Charter / outdated routes at the source,
-  // so state.routes is the display set.
-  const routesHtml = state.routes.map(route => {
+  // Sidebar only lists routes that are currently running — inactive routes
+  // clutter the list with options that can't show any live buses. The
+  // pin picker is where users can still reach them to pre-pin a stop.
+  const routesHtml = state.routes.filter(r => r.active !== false).map(route => {
     const routeIdStr = String(route.myid);
     const isShowing = state.routeDisplay.get(routeIdStr) === true;
     const chip = chipFor(routeIdStr);
@@ -1101,17 +1107,270 @@ function initRefreshButton() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Pin picker modal: a two-step flow (select route → select stop) that
+// replaces the bare unpin button. The user can also clear the current pin
+// from inside the picker, so unpinning is still reachable.
+// ---------------------------------------------------------------------------
+
+const pickerState = {
+  step: 'routes',              // 'routes' | 'stops'
+  selectedRouteId: null,
+  inactiveExpanded: false,     // "Not running now" collapsible section state
+};
+
 /**
- * Wire a single delegated click handler for pin/unpin buttons. Popup DOM
+ * Open the picker on the route-selection step, highlighting whichever
+ * route is currently pinned (if any). If the current pin is on an
+ * inactive route, the "Not running now" section auto-expands so the
+ * user immediately sees it.
+ */
+function openPinPicker() {
+  const picker = document.getElementById('pin-picker');
+  if (!picker) return;
+  pickerState.step = 'routes';
+  pickerState.selectedRouteId = null;
+
+  const pinnedRouteId = state.pinnedStop?.routeId;
+  const pinnedRoute = pinnedRouteId
+    ? state.routes.find(r => r.myid === pinnedRouteId)
+    : null;
+  pickerState.inactiveExpanded = pinnedRoute ? pinnedRoute.active === false : false;
+
+  picker.classList.remove('hidden');
+  renderPinPickerRoutes();
+}
+
+function closePinPicker() {
+  const picker = document.getElementById('pin-picker');
+  if (!picker) return;
+  picker.classList.add('hidden');
+}
+
+/**
+ * Build HTML for a single route row. `inactive` applies dimmed styling
+ * and an "offline" badge so users understand the route isn't running now.
+ */
+function renderPinPickerRouteRow(route, pinnedRouteId, inactive) {
+  const routeId   = route.myid;
+  const chip      = chipFor(routeId);
+  const color     = route.color || '#a31f34';
+  const isCurrent = routeId === pinnedRouteId;
+  const classes = [
+    'pin-picker-row',
+    isCurrent ? 'pin-picker-row-active' : '',
+    inactive ? 'pin-picker-row-inactive' : '',
+  ].filter(Boolean).join(' ');
+
+  let badge = '';
+  if (isCurrent) {
+    badge = '<span class="pin-picker-current">current</span>';
+  } else if (inactive) {
+    badge = '<span class="pin-picker-badge-offline">offline</span>';
+  }
+
+  return `
+    <button class="${classes}" data-pp-route="${routeId}">
+      <span class="provider-chip">${chip}</span>
+      <span class="pin-picker-color" style="background:${color}"></span>
+      <span class="pin-picker-row-label">${route.name || routeId}</span>
+      ${badge}
+      <svg class="pin-picker-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 18l6-6-6-6"/>
+      </svg>
+    </button>
+  `;
+}
+
+/**
+ * Render the route-selection step. Routes split into an always-visible
+ * "active" list (currently running) and a collapsible "Not running now"
+ * section for outdated routes — the user can still pre-pin a stop there
+ * for when the route comes back online. Current pin (if any) is sorted
+ * to the top of whichever section it belongs to.
+ */
+function renderPinPickerRoutes() {
+  const body  = document.querySelector('#pin-picker .pin-picker-body');
+  const back  = document.querySelector('#pin-picker .pin-picker-back');
+  const title = document.querySelector('#pin-picker .pin-picker-title');
+  if (!body) return;
+
+  pickerState.step = 'routes';
+  pickerState.selectedRouteId = null;
+
+  back.classList.add('hidden');
+  title.textContent = 'Select a route';
+
+  const pinnedRouteId = state.pinnedStop?.routeId || null;
+
+  const byNameCurrentFirst = (a, b) => {
+    if (a.myid === pinnedRouteId && b.myid !== pinnedRouteId) return -1;
+    if (b.myid === pinnedRouteId && a.myid !== pinnedRouteId) return 1;
+    return (a.name || '').localeCompare(b.name || '');
+  };
+
+  const activeRoutes   = state.routes.filter(r => r.active !== false).slice().sort(byNameCurrentFirst);
+  const inactiveRoutes = state.routes.filter(r => r.active === false).slice().sort(byNameCurrentFirst);
+
+  let html = '';
+
+  if (state.pinnedStop) {
+    html += `
+      <button class="pin-picker-row pin-picker-clear" data-pp-action="clear">
+        <span class="pin-picker-row-label">Clear current pin</span>
+        <span class="pin-picker-row-sub">Hides the approach panel</span>
+      </button>
+    `;
+  }
+
+  // Active routes — always visible.
+  for (const route of activeRoutes) {
+    html += renderPinPickerRouteRow(route, pinnedRouteId, false);
+  }
+
+  // Inactive routes — under a collapsible toggle.
+  if (inactiveRoutes.length > 0) {
+    const expanded = pickerState.inactiveExpanded;
+    const chevronRot = expanded ? 'rotate(90deg)' : 'rotate(0deg)';
+    html += `
+      <button class="pin-picker-toggle${expanded ? ' expanded' : ''}" data-pp-action="toggle-inactive">
+        <svg class="pin-picker-toggle-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="transform:${chevronRot}">
+          <path d="M9 18l6-6-6-6"/>
+        </svg>
+        <span class="pin-picker-toggle-label">Not running now</span>
+        <span class="pin-picker-toggle-count">${inactiveRoutes.length}</span>
+      </button>
+    `;
+    if (expanded) {
+      html += '<div class="pin-picker-inactive-list">';
+      for (const route of inactiveRoutes) {
+        html += renderPinPickerRouteRow(route, pinnedRouteId, true);
+      }
+      html += '</div>';
+    }
+  }
+
+  if (activeRoutes.length === 0 && inactiveRoutes.length === 0) {
+    html = '<div class="pin-picker-empty">Routes are still loading…</div>';
+  }
+
+  body.innerHTML = html;
+  body.scrollTop = 0;
+}
+
+/**
+ * Render the stop-selection step for a given route. Auto-scrolls the
+ * currently-pinned stop into view so the user can see where they are.
+ */
+function renderPinPickerStops(routeId) {
+  const body  = document.querySelector('#pin-picker .pin-picker-body');
+  const back  = document.querySelector('#pin-picker .pin-picker-back');
+  const title = document.querySelector('#pin-picker .pin-picker-title');
+  if (!body) return;
+
+  pickerState.step = 'stops';
+  pickerState.selectedRouteId = routeId;
+
+  back.classList.remove('hidden');
+  const routeInfo = state.routeData?.routeInfo[routeId] || {};
+  title.textContent = routeInfo.name || 'Select a stop';
+
+  const stops = state.routeData?.stops[routeId] || [];
+  const pinnedStopId = state.pinnedStop?.routeId === routeId
+    ? state.pinnedStop.stopId
+    : null;
+
+  let html = '';
+  stops.forEach((stop, idx) => {
+    const isCurrent = String(stop.id) === String(pinnedStopId);
+    html += `
+      <button class="pin-picker-row${isCurrent ? ' pin-picker-row-active' : ''}" data-pp-stop="${stop.id}">
+        <span class="pin-picker-stop-index">${idx + 1}</span>
+        <span class="pin-picker-row-label">${stop.name || `Stop ${idx + 1}`}</span>
+        ${isCurrent ? '<span class="pin-picker-current">pinned</span>' : ''}
+      </button>
+    `;
+  });
+
+  if (stops.length === 0) {
+    html = '<div class="pin-picker-empty">No stops on this route</div>';
+  }
+
+  body.innerHTML = html;
+  body.scrollTop = 0;
+
+  // Scroll the currently-pinned stop into view, if any.
+  const activeEl = body.querySelector('.pin-picker-row-active');
+  if (activeEl) {
+    activeEl.scrollIntoView({ block: 'center', behavior: 'instant' });
+  }
+}
+
+/**
+ * Wire up the picker's event handlers (one-time, at init).
+ */
+function initPinPicker() {
+  const picker = document.getElementById('pin-picker');
+  if (!picker) return;
+
+  picker.querySelector('.pin-picker-close').addEventListener('click', closePinPicker);
+  picker.querySelector('.pin-picker-back').addEventListener('click', renderPinPickerRoutes);
+
+  // Backdrop click to dismiss
+  picker.addEventListener('click', (e) => {
+    if (e.target === picker) closePinPicker();
+  });
+
+  // Escape to close
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !picker.classList.contains('hidden')) {
+      closePinPicker();
+    }
+  });
+
+  // Delegated clicks inside the picker body.
+  picker.querySelector('.pin-picker-body').addEventListener('click', (e) => {
+    // Collapsible "Not running now" toggle.
+    const toggle = e.target.closest('.pin-picker-toggle');
+    if (toggle) {
+      pickerState.inactiveExpanded = !pickerState.inactiveExpanded;
+      renderPinPickerRoutes();
+      return;
+    }
+
+    const row = e.target.closest('.pin-picker-row');
+    if (!row) return;
+
+    if (row.dataset.ppAction === 'clear') {
+      unpinStop();
+      closePinPicker();
+      return;
+    }
+
+    const routeId = row.dataset.ppRoute;
+    if (routeId) {
+      renderPinPickerStops(routeId);
+      return;
+    }
+
+    const stopId = row.dataset.ppStop;
+    if (stopId && pickerState.selectedRouteId) {
+      pinStop(pickerState.selectedRouteId, stopId);
+      closePinPicker();
+    }
+  });
+}
+
+/**
+ * Wire a single delegated click handler for pin/edit buttons. Popup DOM
  * is rebuilt by Leaflet on each open, so binding per-button would leak.
  */
 function initPinDelegation() {
   document.addEventListener('click', (e) => {
-    // Unpin button (✕) on the pinned-panel card has no routeId/stopId pair —
-    // it just clears whatever is pinned.
-    const unpinBtn = e.target.closest('.pinned-panel .unpin-btn');
-    if (unpinBtn) {
-      unpinStop();
+    // Edit button on the pinned-panel card opens the route/stop picker.
+    const editBtn = e.target.closest('.pinned-panel .edit-pin-btn');
+    if (editBtn) {
+      openPinPicker();
       return;
     }
 
@@ -1150,6 +1409,9 @@ async function init() {
 
   // Wire delegated click handler for pin/unpin buttons
   initPinDelegation();
+
+  // Wire the pin picker modal (route + stop selection)
+  initPinPicker();
 
   // Load the persisted pinned stop (or default to Grad Junction West on first visit)
   state.pinnedStop = loadPinnedStop();
