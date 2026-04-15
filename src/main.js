@@ -42,6 +42,7 @@ const state = {
   stopMarkers: new Map(),     // Stop markers grouped by route
   routeData: null,            // Route points and stops data
   pinnedStop: null,           // Single { routeId, stopId } or null
+  lastBusFrac: new Map(),     // `${routeId}:${busId}` -> { frac, time } for smoothing
   updateTimer: null
 };
 
@@ -327,94 +328,146 @@ function drawStopMarkers() {
  * Euclidean distance between two {latitude, longitude} points.
  * Good enough for neighborhood-scale stop-spacing comparisons.
  */
-function euclid(a, b) {
-  return Math.sqrt(
-    Math.pow(a.latitude - b.latitude, 2) +
-    Math.pow(a.longitude - b.longitude, 2)
-  );
-}
+// ---------------------------------------------------------------------------
+// Bus-to-stop position tracking
+//
+// Passio's ETA/next-stop API is disabled for both MIT and EZRide (verified
+// 2026-04-15: "error": "ETA is disabled"), so we have to derive the bus's
+// position along the route from raw GPS. The old implementation tried to
+// interpolate continuously using geometric projection, but that flip-flopped
+// near segment midpoints and (worst case) teleported between far-apart stops
+// on loops that revisit the same geometry.
+//
+// Simplified model per user spec: the bus is either *at a stop* (integer
+// index) or *in transit between two consecutive stops* (halfway = i + 0.5).
+// No continuous interpolation, so no backward-wobble ever.
+// ---------------------------------------------------------------------------
+
+// MIT is at ~42.36°N. We use a single cosine scale factor for all distance
+// math so that one unit of longitude and one unit of latitude cover the same
+// ground distance. Approximate and stable for everything in the Boston area.
+const LAT_COS = Math.cos(42.36 * Math.PI / 180); // ~0.7395
+const LAT_TO_M = 111320;
 
 /**
- * Project `point` onto the straight-line segment A→B and return the
- * fraction t ∈ [0, 1] where that projection lies.
- * t=0 means the projection is at A; t=1 means it's at B.
- * Values outside [0, 1] are clamped so a bus "past" an endpoint snaps to it.
+ * Ground distance in meters between two lat/lon points. Uses the flat-earth
+ * approximation with a fixed cos(lat) scale — accurate to within ~1% at
+ * MIT/Cambridge latitudes, which is way more than we need for a 30-50m
+ * at-stop threshold.
  */
-function projectFractionOnSegment(point, A, B) {
-  const dx = B.latitude - A.latitude;
-  const dy = B.longitude - A.longitude;
-  const lenSq = dx * dx + dy * dy;
-  if (lenSq === 0) return 0;
-
-  const t = (
-    (point.latitude  - A.latitude ) * dx +
-    (point.longitude - A.longitude) * dy
-  ) / lenSq;
-
-  return Math.max(0, Math.min(1, t));
+function distMeters(a, b) {
+  const dLat = (a.latitude - b.latitude) * LAT_TO_M;
+  const dLon = (a.longitude - b.longitude) * LAT_TO_M * LAT_COS;
+  return Math.sqrt(dLat * dLat + dLon * dLon);
 }
 
 /**
- * Compute the bus's *fractional* position along the route's stop sequence.
- * Returns a number in [0, M) where integer values correspond to stops;
- * e.g. 3.5 means the bus is halfway between stop 3 and stop 4.
+ * Point-to-segment distance in meters. A, B, P are lat/lon objects. The
+ * segment is the straight line from A to B in local (cos-corrected) meter
+ * coordinates — precise enough for route-segment picking at city scale.
+ */
+function distMetersToSegment(p, a, b) {
+  const pax = (p.longitude - a.longitude) * LAT_TO_M * LAT_COS;
+  const pay = (p.latitude  - a.latitude ) * LAT_TO_M;
+  const bax = (b.longitude - a.longitude) * LAT_TO_M * LAT_COS;
+  const bay = (b.latitude  - a.latitude ) * LAT_TO_M;
+  const lenSq = bax * bax + bay * bay;
+  if (lenSq === 0) {
+    return Math.sqrt(pax * pax + pay * pay);
+  }
+  let t = (pax * bax + pay * bay) / lenSq;
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  const dx = pax - t * bax;
+  const dy = pay - t * bay;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+/**
+ * Compute the bus's fractional position along the route's stop sequence.
  *
- * Interpolation is a geometric projection onto the line segment between two
- * adjacent stops (not a ratio of raw distances), so the fractional value is
- * strictly bounded by the two integer stop positions it sits between.
- * Returns null if there are no stops or the bus has no coordinates.
+ * Returns an integer when the bus is within a stop's radius (at the stop),
+ * or N + 0.5 when in transit between stop N and stop N+1 in sequence.
+ * Temporal smoothing rejects small circular-backward deltas (GPS jitter)
+ * but accepts large backward jumps (real data corrections).
+ *
+ * The segment (N, N+1) is chosen by picking the consecutive-sequence pair
+ * whose straight-line segment is closest to the bus. This respects the
+ * route's sequence from the start and is robust against routes with
+ * revisited geometry (e.g. Tech Shuttle passes Tech Square twice — stops
+ * 3 and 9 are geographically close but belong to different segments).
+ *
+ * Returns null if the bus has no coordinates or there are no stops.
  */
-function computeBusFractionalIndex(bus, stops) {
+function computeBusFractionalIndex(bus, stops, routeId) {
   if (!stops || stops.length === 0) return null;
   if (typeof bus.latitude !== 'number' || typeof bus.longitude !== 'number') return null;
 
   const M = stops.length;
   if (M === 1) return 0;
 
-  // Find the closest stop.
-  let closestIdx = -1;
-  let closestDist = Infinity;
+  // Step 1: find the CONSECUTIVE-SEQUENCE segment (i, i+1) whose line the
+  // bus is closest to. Not "closest stop then look at its neighbors" —
+  // that geographic-closest-first search gets tripped up by revisited
+  // geometry. This walks the route in sequence order from the start.
+  let bestIdx = -1;
+  let bestDist = Infinity;
   for (let i = 0; i < M; i++) {
-    const s = stops[i];
-    if (typeof s.latitude !== 'number' || typeof s.longitude !== 'number') continue;
-    const d = euclid(bus, s);
-    if (d < closestDist) {
-      closestDist = d;
-      closestIdx = i;
+    const a = stops[i];
+    const b = stops[(i + 1) % M];
+    if (!Number.isFinite(a.latitude) || !Number.isFinite(a.longitude)) continue;
+    if (!Number.isFinite(b.latitude) || !Number.isFinite(b.longitude)) continue;
+    const d = distMetersToSegment(bus, a, b);
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
     }
   }
-  if (closestIdx === -1) return null;
+  if (bestIdx === -1) return null;
 
-  // Of the two neighbors, pick the one the bus is closer to — the bus is
-  // somewhere on the segment between closestIdx and that neighbor.
-  const prevIdx = (closestIdx - 1 + M) % M;
-  const nextIdx = (closestIdx + 1) % M;
-  const distPrev = euclid(bus, stops[prevIdx]);
-  const distNext = euclid(bus, stops[nextIdx]);
+  // Step 2: at-stop vs in-transit, using Passio's per-stop geofence radius.
+  // If the bus is inside either endpoint's radius, snap to that integer
+  // index. Otherwise it's halfway between the two stops on this segment.
+  const aIdx = bestIdx;
+  const bIdx = (bestIdx + 1) % M;
+  const a = stops[aIdx];
+  const b = stops[bIdx];
+  const distA = distMeters(bus, a);
+  const distB = distMeters(bus, b);
+  const radA = Math.max(25, Number(a.radius) || 50);
+  const radB = Math.max(25, Number(b.radius) || 50);
 
-  const otherIdx = distPrev <= distNext ? prevIdx : nextIdx;
-
-  // Project the bus onto the straight-line segment between the two stops and
-  // read off the fraction (clamped to [0, 1]). This keeps the fractional
-  // index strictly bounded between the two adjacent integer stop positions.
-  const fracToward = projectFractionOnSegment(bus, stops[closestIdx], stops[otherIdx]);
-
-  // Compose the effective fractional index, handling circular wraparound.
-  let effective;
-  if (otherIdx === nextIdx) {
-    effective = closestIdx + fracToward;
-  } else if (closestIdx === 0 && otherIdx === M - 1) {
-    // Walking "backward" from stop 0 wraps to M-1.
-    effective = M - fracToward;
+  let rawFrac;
+  if (distA <= radA && distA <= distB) {
+    rawFrac = aIdx;
+  } else if (distB <= radB) {
+    rawFrac = bIdx;
   } else {
-    effective = closestIdx - fracToward;
+    rawFrac = aIdx + 0.5;
+    if (rawFrac >= M) rawFrac -= M;
   }
 
-  // Normalize to [0, M).
-  while (effective < 0) effective += M;
-  while (effective >= M) effective -= M;
+  // Step 3: temporal smoothing. Reject small circular-backward deltas
+  // (GPS noise around the at-stop boundary), but accept large ones so
+  // real data corrections pass through.
+  const cacheKey = `${routeId}:${bus.id}`;
+  const prev = state.lastBusFrac.get(cacheKey);
+  const now = Date.now();
+  let outFrac = rawFrac;
+  if (prev && now - prev.time < 60000) {
+    let delta = rawFrac - prev.frac;
+    // Circular shortest-arc correction.
+    if (delta >  M / 2) delta -= M;
+    if (delta < -M / 2) delta += M;
+    // Tiny backward wobble (≤ 1.0 stops): freeze at previous position.
+    // Larger backward motion (> 1 stop) is accepted as a real correction.
+    if (delta < 0 && delta > -1.0) {
+      outFrac = prev.frac;
+    }
+  }
+  state.lastBusFrac.set(cacheKey, { frac: outFrac, time: now });
 
-  return effective;
+  return outFrac;
 }
 
 /**
@@ -445,7 +498,7 @@ function computeStopArrivals(routeId, stopId) {
   const routeBuses = state.vehicles.filter(v => String(v.routeId) === routeId);
 
   const arrivals = routeBuses.map(bus => {
-    const busFracIdx = computeBusFractionalIndex(bus, routeStops);
+    const busFracIdx = computeBusFractionalIndex(bus, routeStops, routeId);
     if (busFracIdx === null) return { bus, stopsAway: null, stopsAwayFrac: null };
 
     // Circular-route wraparound — reasonable for MIT loops, imperfect for
@@ -518,33 +571,6 @@ function createStopPopupContent(stopData) {
       ${pinBtn}
     </div>
   `;
-}
-
-/**
- * Find the closest stop index for a bus based on its position
- */
-function findClosestStopIndex(bus, stops) {
-  if (!stops || stops.length === 0) return -1;
-  
-  let closestIndex = -1;
-  let closestDistance = Infinity;
-  
-  for (let i = 0; i < stops.length; i++) {
-    const stop = stops[i];
-    if (!stop.latitude || !stop.longitude) continue;
-    
-    const distance = Math.sqrt(
-      Math.pow(bus.latitude - stop.latitude, 2) +
-      Math.pow(bus.longitude - stop.longitude, 2)
-    );
-    
-    if (distance < closestDistance) {
-      closestDistance = distance;
-      closestIndex = i;
-    }
-  }
-  
-  return closestIndex;
 }
 
 /**
@@ -664,16 +690,35 @@ function renderPinnedPanel() {
     busesHtml += renderTrackBusHTML(bus, stopsAway, stopsAwayFrac, labelPosition);
   });
 
-  // Empty-state message when the track has no buses.
-  let emptyHtml = '';
-  if (visible.length === 0) {
-    const text = overflow.length === 0
-      ? 'No active buses on this route'
-      : 'No buses within the next 6 stops';
-    emptyHtml = `<div class="track-empty">${text}</div>`;
+  // Single aggregate marker for every bus beyond the 6-stop window,
+  // pinned to the far-left of the track and labeled "6+ stops". One icon
+  // no matter how many buses are out there — just a hint that more are
+  // coming from further away.
+  if (overflow.length > 0) {
+    const overflowLabelPos = visible.length % 2 === 0 ? 'below' : 'above';
+    const overflowTitle = overflow.length === 1
+      ? '1 more bus beyond 6 stops'
+      : `${overflow.length} more buses beyond 6 stops`;
+    busesHtml += `
+      <div class="track-bus track-bus-overflow label-${overflowLabelPos}"
+           style="--offset-ratio: 1"
+           title="${overflowTitle}">
+        <div class="track-bus-dot">🚌</div>
+        <div class="track-bus-label">6+ stops</div>
+      </div>
+    `;
   }
 
-  // Overflow text list for buses beyond the visible window.
+  // Empty-state message only when there are genuinely no buses anywhere
+  // (nothing visible AND nothing beyond the window).
+  let emptyHtml = '';
+  if (visible.length === 0 && overflow.length === 0) {
+    emptyHtml = `<div class="track-empty">No active buses on this route</div>`;
+  }
+
+  // Text list under the track detailing each bus beyond the 6-stop window.
+  // The 6+ marker on the line is the summary; this row gives the actual
+  // stops-away numbers so the user still knows how far out they are.
   let overflowHtml = '';
   if (overflow.length > 0) {
     const parts = overflow.map(({ stopsAway }) => {
@@ -698,7 +743,7 @@ function renderPinnedPanel() {
     <div class="${trackClass}" style="--pin-color: ${routeColor}">
       <div class="track-line"></div>
       ${prevDotsHtml}
-      <div class="track-stop" title="${stopName}">🚏</div>
+      <div class="track-stop" title="${stopName}"></div>
       ${busesHtml}
       ${emptyHtml}
     </div>

@@ -177,6 +177,9 @@ export async function fetchRouteData(systemKey) {
             name: stop.name,
             latitude: parseFloat(stop.latitude),
             longitude: parseFloat(stop.longitude),
+            // Passio's own "at-stop" geofence radius, in meters. Used by the
+            // UI to decide when a bus is parked at the stop vs in-transit.
+            radius: Number.isFinite(parseFloat(stop.radius)) ? parseFloat(stop.radius) : 50,
             routeId: stop.routeId ? prefixRouteId(systemKey, stop.routeId) : null,
             routeName: stop.routeName,
             systemKey,

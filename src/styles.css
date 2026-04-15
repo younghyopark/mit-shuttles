@@ -124,7 +124,7 @@ body {
   background: var(--bg-card);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
-  padding: 0.55rem 0.85rem 0.7rem;
+  padding: 0.55rem 0.85rem 0.5rem;
   z-index: 900;
 }
 
@@ -183,20 +183,19 @@ body {
 
 /* Approach-line track: horizontal line, previous-stop dots, stop at right,
    and bus markers that slide smoothly along it. The coordinate system is
-   a --offset-ratio in [0, 1] where 0 = destination and 1 = 6 stops away. */
+   a --offset-ratio in [0, 1] where 0 = destination and 1 = 6 stops away.
+   Height is kept tight: just enough for the bus dot plus labels above/below. */
 .pinned-track {
   position: relative;
-  height: 84px;
-  margin-top: 0.55rem;
-  /* Shared placement helpers for all dots on the line. The line itself sits
-     at top: 42px; markers are centered on it vertically. */
+  height: 62px;
+  margin-top: 0.35rem;
 }
 
 .track-line {
   position: absolute;
   left: 18px;
   right: 18px;
-  top: 42px;
+  top: 31px;
   height: 2px;
   background: linear-gradient(
     to right,
@@ -209,7 +208,7 @@ body {
 /* Small faint dots marking the N previous stops on the route */
 .track-prev-dot {
   position: absolute;
-  top: 42px;
+  top: 31px;
   right: calc(18px + var(--offset-ratio, 0.5) * (100% - 36px));
   width: 7px;
   height: 7px;
@@ -220,44 +219,58 @@ body {
   z-index: 1;
 }
 
+/* Destination marker: a tall vertical bar at the far right of the track.
+   It extends well above AND below the line so the bus marker (30px, centered
+   on the line) can cross in front of it without ever fully occluding it —
+   there's always a visible segment of bar peeking out above and below. */
 .track-stop {
   position: absolute;
   right: 18px;
-  top: 42px;
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
+  top: 6px;
+  transform: translateX(50%);
+  width: 4px;
+  height: 52px;
   background: var(--pin-color, var(--primary));
-  border: 2px solid rgba(255, 255, 255, 0.95);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 15px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
-  z-index: 4;
-  transform: translate(50%, -50%);
+  border-radius: 2px;
+  z-index: 2;
+  /* Hide any legacy text content (emoji). The shape itself is the marker. */
+  font-size: 0;
+  line-height: 0;
+  color: transparent;
 }
 
-/* Subtle ring pulse on the destination when a bus is arriving */
-.pinned-track.arriving .track-stop::after {
+/* A stop-circle at the line level, matching the previous-stop dots, so the
+   destination reads as "another stop on the track" with the vertical bar
+   rising from it. Sits centered on the bar's x position and on the line's
+   y position (line top: 31px in track coords → 25px in track-stop coords). */
+.track-stop::after {
   content: '';
   position: absolute;
-  inset: -5px;
+  left: 50%;
+  top: 25px;
+  transform: translate(-50%, -50%);
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
-  border: 2px solid var(--pin-color, var(--primary));
-  animation: stopPulse 1.6s ease-out infinite;
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.28);
 }
 
-@keyframes stopPulse {
-  0%   { opacity: 0.8; transform: scale(0.85); }
-  100% { opacity: 0;   transform: scale(1.6);  }
+/* Bar glows when a bus is arriving (0 or 1 stops away) */
+.pinned-track.arriving .track-stop {
+  animation: stopBarPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes stopBarPulse {
+  0%, 100% { box-shadow: none; }
+  50%      { box-shadow: 0 0 10px var(--pin-color, var(--primary)); }
 }
 
 /* Bus marker on the track, positioned via --offset-ratio (0–1).
    0 = at the destination (right edge), 1 = 6 stops away (left edge). */
 .track-bus {
   position: absolute;
-  top: 42px;
+  top: 31px;
   right: calc(18px + var(--offset-ratio, 0.5) * (100% - 36px));
   z-index: 3;
   transform: translate(50%, -50%);
@@ -305,11 +318,11 @@ body {
 }
 
 .track-bus.label-below .track-bus-label {
-  top: 20px;
+  top: 17px;
 }
 
 .track-bus.label-above .track-bus-label {
-  bottom: 20px;
+  bottom: 17px;
 }
 
 .track-bus-label strong {
@@ -341,11 +354,25 @@ body {
   display: none;
 }
 
-/* Overflow text list for buses beyond the 6-stop window */
+/* A single aggregate marker at the far-left of the track representing
+   every bus beyond the 6-stop window. Dashed border + subtle dimming
+   reads as "abstract placeholder" rather than a specific tracked bus. */
+.track-bus-overflow .track-bus-dot {
+  border-style: dashed;
+  opacity: 0.75;
+}
+
+.track-bus-overflow .track-bus-label {
+  opacity: 0.8;
+}
+
+/* Text row listing each 6+ stop bus with its actual stops-away count.
+   Rendered beneath the track; the overflow marker on the line is the
+   summary icon, this row is the detail. */
 .pinned-overflow {
   font-size: 0.7rem;
   color: var(--text-muted);
-  margin-top: 0.35rem;
+  margin-top: 0.15rem;
   white-space: nowrap;
   overflow-x: auto;
   scrollbar-width: none;
@@ -353,10 +380,6 @@ body {
 }
 
 .pinned-overflow::-webkit-scrollbar {
-  display: none;
-}
-
-.pinned-overflow.hidden {
   display: none;
 }
 
