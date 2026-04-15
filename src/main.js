@@ -923,14 +923,28 @@ function renderRouteFilters() {
 }
 
 /**
- * Update connection status indicator
+ * Update connection status indicator.
+ *
+ * The header area is tight on mobile, so we stack the status over two
+ * lines: everything up to the first bullet separator goes on line 1, and
+ * the rest (e.g. "11 shuttles") wraps onto line 2. This avoids ugly
+ * mid-phrase word breaks like "Updated: 1:23 PM • 11 / shuttles".
  */
 function updateStatus(connected, message) {
   const dot = document.getElementById('connection-status');
-  const text = document.getElementById('last-update');
-  
+  const line1 = document.getElementById('last-update-line1');
+  const line2 = document.getElementById('last-update-line2');
+
   dot.className = 'status-dot ' + (connected ? 'connected' : 'error');
-  text.textContent = message;
+
+  const bulletIdx = message.indexOf(' • ');
+  if (bulletIdx >= 0) {
+    line1.textContent = message.slice(0, bulletIdx);
+    line2.textContent = message.slice(bulletIdx + 3);
+  } else {
+    line1.textContent = message;
+    line2.textContent = '';
+  }
 }
 
 /**
