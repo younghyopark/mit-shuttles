@@ -6,15 +6,14 @@
 const BASE_URL = 'https://passiogo.com';
 const MIT_SYSTEM_ID = '94';
 
-// Use a CORS proxy for browser requests
-// In production, you'd want your own backend proxy
-const CORS_PROXY = 'https://corsproxy.io/?';
+// Passio GO sends Access-Control-Allow-Origin: * directly on responses,
+// so we can call it from the browser without a CORS proxy.
 
 /**
  * Make a POST request to the Passio GO API
  */
 async function apiRequest(endpoint, params) {
-  const url = `${CORS_PROXY}${encodeURIComponent(`${BASE_URL}/${endpoint}`)}`;
+  const url = `${BASE_URL}/${endpoint}`;
   
   const body = new URLSearchParams({
     json: JSON.stringify(params)
