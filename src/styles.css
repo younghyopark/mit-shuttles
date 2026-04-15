@@ -320,6 +320,12 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  /* Flip the bus emoji so its "front" faces right — buses on this
+     track are always approaching the pinned stop from the left, and
+     the default Apple/Google glyph faces left, which reads as the bus
+     moving backwards. The keyframes below include scaleX(-1) too so
+     the pulse animation on .arriving doesn't clobber the flip. */
+  transform: scaleX(-1);
   font-size: 16px;
   line-height: 1;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.55);
@@ -330,8 +336,8 @@ body {
 }
 
 @keyframes busArrive {
-  0%, 100% { transform: scale(1);    }
-  50%      { transform: scale(1.12); }
+  0%, 100% { transform: scaleX(-1) scale(1);    }
+  50%      { transform: scaleX(-1) scale(1.12); }
 }
 
 /* Alternating label positions keep adjacent labels from overlapping: even-
