@@ -7,11 +7,11 @@
 :root {
   --primary: #a31f34;
   --primary-dark: #8a1a2c;
-  --bg-dark: #1a1a2e;
-  --bg-card: #16213e;
+  --bg-dark: #181818;
+  --bg-card: #232323;
   --text: #eee;
-  --text-muted: #aaa;
-  --border: #2a2a4a;
+  --text-muted: #999;
+  --border: #333;
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
 }
 
@@ -315,7 +315,7 @@ body {
   width: 30px;
   height: 30px;
   border-radius: 50%;
-  background: rgba(20, 20, 36, 0.92);
+  background: rgba(24, 24, 24, 0.92);
   border: 2px solid var(--pin-color, var(--primary));
   display: flex;
   align-items: center;
@@ -353,7 +353,7 @@ body {
   text-align: center;
   padding: 1px 4px;
   border-radius: 3px;
-  background: rgba(22, 33, 62, 0.78);
+  background: rgba(24, 24, 24, 0.78);
   pointer-events: none;
 }
 
@@ -396,7 +396,7 @@ body {
   color: var(--text);
   padding: 0 3px;
   border-radius: 3px;
-  background: rgba(22, 33, 62, 0.88);
+  background: rgba(24, 24, 24, 0.88);
   pointer-events: none;
   letter-spacing: -0.01em;
 }
@@ -569,156 +569,216 @@ body {
   z-index: 1;
 }
 
-/* Sidebar - Desktop */
-.sidebar {
-  width: 300px;
+/* ==================== ROUTE FAB + PICKER ==================== */
+
+/* Floating button in the bottom-right corner of the map. Opens the
+   compact route-selection popover. Sits above the Leaflet attribution
+   and respects the safe-area inset on phones with home-bar gestures. */
+.route-fab {
+  position: absolute;
+  bottom: calc(20px + var(--safe-area-bottom));
+  right: 12px;
+  z-index: 800;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  border: none;
   background: var(--bg-card);
-  border-left: 1px solid var(--border);
-  overflow-y: auto;
-  flex-shrink: 0;
+  color: var(--text);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
   display: flex;
-  flex-direction: column;
-  order: 2;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, transform 0.1s;
+  -webkit-tap-highlight-color: transparent;
 }
 
-.sidebar-handle {
+.route-fab:hover {
+  background: #2e2e2e;
+}
+
+.route-fab:active {
+  transform: scale(0.93);
+}
+
+/* Dark/light map toggle — visually identical to the route FAB, stacked
+   above it with a small gap so the two buttons read as a toolbar. */
+.theme-toggle {
+  position: absolute;
+  bottom: calc(72px + var(--safe-area-bottom));
+  right: 12px;
+  z-index: 800;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  border: none;
+  background: var(--bg-card);
+  color: var(--text);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, transform 0.1s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.theme-toggle:hover {
+  background: #2e2e2e;
+}
+
+.theme-toggle:active {
+  transform: scale(0.93);
+}
+
+/* The route picker is a compact popover anchored above the FAB.
+   position:absolute inside .main so it shares the map's coordinate
+   space, z-indexed above bus markers but below modals. */
+/* Full-screen overlay with backdrop blur. The picker card is centered
+   vertically and horizontally so it reads as a focused modal, not a
+   dropdown anchored to the FAB. */
+.route-picker {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  animation: pickerOverlayIn 0.15s ease-out;
+}
+
+.route-picker.hidden {
   display: none;
 }
 
-.sidebar-content {
-  flex: 1;
+@keyframes pickerOverlayIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.route-picker-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+  min-width: 260px;
+  max-width: 320px;
+  width: 85vw;
+  max-height: 70vh;
   overflow-y: auto;
+  animation: pickerCardIn 0.15s ease-out;
 }
 
-.section {
-  padding: 1rem;
-  border-bottom: 1px solid var(--border);
+@keyframes pickerCardIn {
+  from { opacity: 0; transform: scale(0.92); }
+  to   { opacity: 1; transform: scale(1); }
 }
 
-.section h2 {
-  font-size: 0.8rem;
-  font-weight: 600;
+.route-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 10px 8px 18px;
+  font-size: 0.75rem;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--text-muted);
-  margin-bottom: 0.75rem;
-}
-
-.shuttle-section h2 {
-  display: none;
-}
-
-/* Shuttle list */
-.shuttle-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.shuttle-card {
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 10px;
-  padding: 0.75rem;
-  cursor: pointer;
-  transition: all 0.2s;
-  border-left: 3px solid var(--route-color, var(--primary));
-}
-
-/* Shuttle cards for buses on non-focused routes are desaturated and
-   darkened (no transparency) to match the map-marker tinting. */
-.shuttle-card.tinted {
-  filter: saturate(0.15) brightness(0.7);
-}
-
-.shuttle-card.tinted:hover {
-  filter: none;
-}
-
-.shuttle-card:hover {
-  background: rgba(255, 255, 255, 0.1);
-}
-
-.shuttle-card:active {
-  transform: scale(0.98);
-}
-
-.shuttle-card .bus-number {
-  font-weight: 600;
-  font-size: 1rem;
-  margin-bottom: 0.15rem;
-}
-
-.shuttle-card .route-name {
-  font-size: 0.8rem;
-  color: var(--text-muted);
-  margin-bottom: 0.4rem;
-}
-
-.shuttle-card .details {
-  display: flex;
-  gap: 0.75rem;
-  font-size: 0.7rem;
+  letter-spacing: 0.06em;
   color: var(--text-muted);
 }
 
-.shuttle-card .passengers {
+.route-picker-close {
   display: flex;
   align-items: center;
-  gap: 0.25rem;
-}
-
-/* Route filters */
-.route-filters {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.route-filter {
-  display: flex;
-  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
   border-radius: 8px;
-  transition: all 0.2s;
-}
-
-.route-toggle-btn {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.6rem 0.75rem;
-  width: 100%;
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid transparent;
-  border-radius: 8px;
-  cursor: pointer;
+  background: none;
   color: var(--text-muted);
-  font-size: 0.85rem;
-  text-align: left;
-  transition: all 0.2s;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  -webkit-tap-highlight-color: transparent;
 }
 
-.route-toggle-btn:hover {
+.route-picker-close:hover {
   background: rgba(255, 255, 255, 0.08);
   color: var(--text);
 }
 
-.route-toggle-btn:active {
-  transform: scale(0.98);
+.route-picker-list {
+  display: flex;
+  flex-direction: column;
+  padding: 0 6px 6px;
 }
 
-.route-filter.active .route-toggle-btn {
-  background: rgba(163, 31, 52, 0.2);
-  border-color: var(--primary);
+/* Each row is a tappable button showing route color + name + check.
+   Active routes get a subtle highlight; inactive routes are dimmed. */
+.route-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.route-picker-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.route-picker-item:active {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.route-picker-item.active {
   color: var(--text);
 }
 
-.route-color {
-  width: 12px;
-  height: 12px;
+.route-picker-color {
+  width: 10px;
+  height: 10px;
   border-radius: 3px;
   flex-shrink: 0;
+  opacity: 0.4;
+  transition: opacity 0.12s;
 }
 
+.route-picker-item.active .route-picker-color {
+  opacity: 1;
+}
+
+.route-picker-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.route-picker-check {
+  font-size: 0.75rem;
+  opacity: 0;
+  transition: opacity 0.12s;
+  color: #10b981;
+}
+
+.route-picker-item.active .route-picker-check {
+  opacity: 1;
+}
+
+/* Provider chip (used in pinned panel, pin picker, and route picker) */
 .provider-chip {
   font-size: 0.62em;
   font-weight: 700;
@@ -729,29 +789,6 @@ body {
   letter-spacing: 0.03em;
   flex-shrink: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-}
-
-.route-filter.active .provider-chip {
-  background: rgba(255, 255, 255, 0.15);
-  color: rgba(255, 255, 255, 0.9);
-}
-
-.route-name {
-  flex: 1;
-}
-
-.route-toggle-icon {
-  font-size: 0.85rem;
-  opacity: 0.6;
-}
-
-.route-helper-text {
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  margin-bottom: 0.75rem;
-  padding-bottom: 0.5rem;
-  border-bottom: 1px solid var(--border);
-  font-style: italic;
 }
 
 .loading {
@@ -905,12 +942,6 @@ body {
   accent-color: var(--primary);
   width: 16px;
   height: 16px;
-}
-
-.routes-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
 }
 
 /* ==================== PIN PICKER MODAL ==================== */
@@ -1234,19 +1265,19 @@ body {
     padding: 0.4rem 0.75rem;
     padding-top: max(0.4rem, env(safe-area-inset-top));
   }
-  
+
   .header h1 {
     font-size: 1rem;
   }
-  
+
   .refresh-btn {
     display: flex;
   }
-  
+
   .main {
     flex-direction: column;
   }
-  
+
   .map {
     position: absolute;
     top: 0;
@@ -1254,140 +1285,25 @@ body {
     right: 0;
     bottom: 0;
   }
-  
-  /* Mobile sidebar as bottom sheet */
-  .sidebar {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    width: 100%;
-    max-height: 60vh;
-    border-left: none;
-    border-radius: 20px 20px 0 0;
-    box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.4);
-    z-index: 1000;
-    transition: transform 0.3s ease;
-    order: unset;
-    padding-bottom: var(--safe-area-bottom);
-  }
-  
-  .sidebar.collapsed {
-    transform: translateY(calc(100% - 70px - var(--safe-area-bottom)));
-  }
-  
-  .sidebar-handle {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 0.75rem 1rem;
-    cursor: grab;
-    user-select: none;
-    -webkit-user-select: none;
-    touch-action: pan-y;
-  }
-  
-  .sidebar-handle:active {
-    cursor: grabbing;
-  }
-  
-  .handle-bar {
-    width: 40px;
-    height: 5px;
-    background: rgba(255, 255, 255, 0.4);
-    border-radius: 3px;
-    margin-bottom: 0.5rem;
-    transition: background 0.2s;
-  }
-  
-  .sidebar-handle:active .handle-bar {
-    background: rgba(255, 255, 255, 0.6);
-  }
-  
-  .handle-label {
-    font-size: 0.85rem;
-    font-weight: 600;
-    color: var(--text);
-  }
-  
-  .sidebar-content {
-    max-height: calc(60vh - 70px);
-    overflow-y: auto;
-    -webkit-overflow-scrolling: touch;
-  }
-  
-  .section {
-    padding: 0.75rem 1rem;
-  }
-  
-  .shuttle-section {
-    padding-top: 0;
-  }
-  
-  /* Horizontal scrolling shuttle cards on mobile */
-  .shuttle-list {
-    flex-direction: row;
-    overflow-x: auto;
-    gap: 0.6rem;
-    padding-bottom: 0.5rem;
-    scroll-snap-type: x mandatory;
-    -webkit-overflow-scrolling: touch;
-  }
-  
-  .shuttle-list::-webkit-scrollbar {
-    display: none;
-  }
-  
-  .shuttle-card {
-    min-width: 160px;
-    flex-shrink: 0;
-    scroll-snap-align: start;
-    border-left-width: 4px;
-  }
-  
-  .routes-section {
-    border-top: 1px solid var(--border);
-  }
-  
-  /* Route filters as horizontal pills on mobile */
-  .route-filters {
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-  }
-  
-  .route-filter {
-    flex: 0 0 auto;
-  }
-  
-  .route-toggle-btn {
-    padding: 0.5rem 0.75rem;
-    font-size: 0.8rem;
-    border-radius: 20px;
-  }
-  
-  .route-helper-text {
-    font-size: 0.7rem;
-  }
-  
+
   /* Adjust Leaflet controls for mobile */
   .leaflet-control-zoom {
     margin-left: 10px !important;
     margin-top: 10px !important;
   }
-  
+
   .leaflet-control-zoom a {
     width: 36px !important;
     height: 36px !important;
     line-height: 36px !important;
     font-size: 18px !important;
   }
-  
+
   /* Better popup on mobile */
   .leaflet-popup-content-wrapper {
     border-radius: 16px;
   }
-  
+
   .leaflet-popup-content {
     margin: 12px 14px;
   }
@@ -1398,32 +1314,8 @@ body {
   .header h1 {
     font-size: 0.9rem;
   }
-  
+
   .status {
     font-size: 0.7rem;
-  }
-  
-  .shuttle-card {
-    min-width: 145px;
-    padding: 0.6rem;
-  }
-  
-  .shuttle-card .bus-number {
-    font-size: 0.9rem;
-  }
-}
-
-/* Landscape mobile */
-@media (max-width: 768px) and (orientation: landscape) {
-  .sidebar {
-    max-height: 50vh;
-  }
-  
-  .sidebar.collapsed {
-    transform: translateY(calc(100% - 60px));
-  }
-  
-  .sidebar-content {
-    max-height: calc(50vh - 60px);
   }
 }

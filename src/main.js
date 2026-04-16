@@ -18,6 +18,16 @@ const DEFAULT_ZOOM = 15;
 // Update interval in milliseconds
 const UPDATE_INTERVAL = 5000;
 
+// Map tile URLs — CARTO provides both a dark and light basemap at the
+// same CDN with identical zoom/subdomains/attribution. Toggling between
+// them is a tile-layer swap, no other config changes needed.
+const TILE_URLS = {
+  dark:  'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  light: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+};
+const TILE_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>';
+const MAP_THEME_KEY = 'mit-shuttle-map-theme';
+
 // LocalStorage key for route display preferences
 const STORAGE_KEY = 'mit-shuttle-route-display';
 
@@ -39,6 +49,8 @@ const DEFAULT_PINNED_STOP = { routeId: 'mit:63220', stopId: '180113' };
 // Application state
 const state = {
   map: null,
+  tileLayer: null,            // Current Leaflet tile layer (swapped on theme toggle)
+  mapTheme: localStorage.getItem(MAP_THEME_KEY) || 'light',
   routes: [],
   vehicles: [],
   markers: new Map(),
@@ -104,13 +116,45 @@ function initMap() {
     zoomDelta: 1,
   });
 
-  // Add dark tile layer
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  // Add tile layer — respects the persisted theme preference.
+  state.tileLayer = L.tileLayer(TILE_URLS[state.mapTheme] || TILE_URLS.dark, {
+    attribution: TILE_ATTRIBUTION,
     subdomains: 'abcd',
-    maxZoom: 20
+    maxZoom: 20,
   }).addTo(state.map);
 }
+
+/**
+ * Swap the map between dark and light CARTO tiles. Persists the choice
+ * in localStorage so it survives page reloads.
+ */
+function toggleMapTheme() {
+  const next = state.mapTheme === 'dark' ? 'light' : 'dark';
+  state.mapTheme = next;
+  try { localStorage.setItem(MAP_THEME_KEY, next); } catch (_) {}
+
+  // Swap the tile layer in place. Leaflet handles the transition —
+  // visible tiles from the old layer are removed and the new ones
+  // stream in without a flash because both CARTO variants share the
+  // same zoom/subdomains config.
+  if (state.tileLayer) {
+    state.map.removeLayer(state.tileLayer);
+  }
+  state.tileLayer = L.tileLayer(TILE_URLS[next], {
+    attribution: TILE_ATTRIBUTION,
+    subdomains: 'abcd',
+    maxZoom: 20,
+  }).addTo(state.map);
+
+  // Update the toggle button icon: sun when dark (tap to go light),
+  // moon when light (tap to go dark).
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.innerHTML = next === 'dark' ? sunSVG : moonSVG;
+}
+
+// Compact SVG icons for the theme toggle button.
+const sunSVG = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>`;
+const moonSVG = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`;
 
 /**
  * Save route display preferences to localStorage
@@ -1633,7 +1677,6 @@ function updateRouteDisplay() {
   // on freshly-unfocused routes dim.
   if (state.vehicles.length > 0) {
     updateVehicleMarkers(state.vehicles);
-    renderShuttleList(state.vehicles);
   }
 }
 
@@ -1709,37 +1752,19 @@ function fitMapToVisibleRoutes({ animate = true } = {}) {
   const bounds = computeVisibleRouteBounds();
   if (!bounds || !bounds.isValid()) return;
 
-  // IMPORTANT — overlay vs sibling distinction:
-  //
-  // The pinned panel (#pinned-panel) is a DOM sibling of <main> in the
-  // app flex column, not an overlay. When it's visible, the map
-  // container's offsetHeight is ALREADY shorter — Leaflet sees the
-  // correct size after invalidateSize above. We must NOT pad again for
-  // it, or we'd double-count and cut available map pixels in half.
-  //
-  // The mobile sidebar (#sidebar) IS an overlay — on phone widths it's
-  // position:absolute and the map container extends behind it. So we
-  // DO need to reserve bottom padding equal to however much of the
-  // sheet is visible (the collapsed handle area, typically ~80px).
-  //
-  // This asymmetry is why the padding numbers aren't symmetric: top
-  // gets only breathing room, bottom gets breathing room plus the
-  // sheet reserve.
-  const isMobile = window.innerWidth <= 768;
-  const sidebar = document.getElementById('sidebar');
-  const sheetCollapsed = sidebar?.classList.contains('collapsed');
-  // Collapsed handle is ~80px tall on mobile; expanded sheet covers a
-  // much larger area but we cap at 260px so the fit still has some
-  // headroom to show content in landscape orientation.
-  const bottomReserve = isMobile
-    ? (sheetCollapsed ? 80 : Math.min(sidebar?.offsetHeight ?? 0, 260))
-    : 0;
-
+  // The pinned panel is a DOM sibling of <main>, not an overlay — when
+  // it's visible, the map container is already shorter and Leaflet's
+  // invalidateSize picks that up. So we only pad for breathing room,
+  // no bottom overlay reserve (the old sidebar bottom-sheet is gone,
+  // replaced by the floating FAB which doesn't occlude content).
   const BREATHING_ROOM = 18;
+  // Reserve a bit more at the bottom so the route doesn't butt up
+  // against the FAB / Leaflet attribution area.
+  const BOTTOM_ROOM = 60;
 
   state.map.fitBounds(bounds, {
     paddingTopLeft:    [BREATHING_ROOM, BREATHING_ROOM],
-    paddingBottomRight:[BREATHING_ROOM, BREATHING_ROOM + bottomReserve],
+    paddingBottomRight:[BREATHING_ROOM, BOTTOM_ROOM],
     // Clamp how far Leaflet is willing to zoom IN. Without this, a
     // very small route (e.g. two very close stops) would zoom to
     // street level and lose all context.
@@ -1771,12 +1796,21 @@ function updateVehicleMarkers(vehicles) {
     }
   }
 
-  // Update or create markers
+  // Update or create markers — only for buses on selected routes.
+  // Buses on non-selected routes are removed from the map entirely
+  // (not just tinted) so the map stays clean and uncluttered.
   for (const vehicle of vehicles) {
-    // Use route info from vehicle data (API provides it directly)
+    if (!isVehicleFocused(vehicle)) {
+      // Remove marker if it exists from a previously-selected route
+      if (state.markers.has(vehicle.id)) {
+        state.map.removeLayer(state.markers.get(vehicle.id));
+        state.markers.delete(vehicle.id);
+      }
+      continue;
+    }
+
     const routeColor = vehicle.routeColor || '#a31f34';
     const routeName = vehicle.routeName || 'Unknown Route';
-    const tinted = !isVehicleFocused(vehicle);
 
     const popupContent = `
       <div class="popup-content">
@@ -1788,15 +1822,13 @@ function updateVehicleMarkers(vehicles) {
     `;
 
     if (state.markers.has(vehicle.id)) {
-      // Update existing marker
       const marker = state.markers.get(vehicle.id);
       marker.setLatLng([vehicle.latitude, vehicle.longitude]);
-      marker.setIcon(createBusIcon(routeColor, vehicle.heading, tinted));
+      marker.setIcon(createBusIcon(routeColor, vehicle.heading, false));
       marker.getPopup().setContent(popupContent);
     } else {
-      // Create new marker
       const marker = L.marker([vehicle.latitude, vehicle.longitude], {
-        icon: createBusIcon(routeColor, vehicle.heading, tinted)
+        icon: createBusIcon(routeColor, vehicle.heading, false)
       }).addTo(state.map);
 
       marker.bindPopup(popupContent);
@@ -1808,104 +1840,93 @@ function updateVehicleMarkers(vehicles) {
 /**
  * Render the shuttle list in the sidebar
  */
-function renderShuttleList(vehicles) {
-  const container = document.getElementById('shuttle-list');
-  
-  // Update shuttle count in handle
-  updateShuttleCount(vehicles.length);
-  
-  if (vehicles.length === 0) {
-    container.innerHTML = '<p class="loading">No active shuttles</p>';
-    return;
-  }
-  
-  container.innerHTML = vehicles.map(vehicle => {
-    // Use route info directly from vehicle data
-    const routeName = vehicle.routeName || 'Unknown Route';
-    const routeColor = vehicle.routeColor || '#a31f34';
-    const loadPercent = vehicle.capacity > 0 ? Math.round((vehicle.passengers / vehicle.capacity) * 100) : 0;
-    const tintedClass = isVehicleFocused(vehicle) ? '' : ' tinted';
+/**
+ * Render the compact route picker popover. Each active route gets a
+ * toggleable row with its color dot, provider chip, name, and a check
+ * mark when it's turned on. Click a row to toggle. The picker is
+ * shown/hidden by the FAB button (initRouteFab wires that up).
+ */
+function renderRoutePicker() {
+  const list = document.getElementById('route-picker-list');
+  if (!list) return;
 
+  const html = state.routes.filter(r => r.active !== false).map(route => {
+    const routeId = String(route.myid);
+    const on = state.routeDisplay.get(routeId) === true;
+    const chip = chipFor(routeId);
+    const color = route.color || '#a31f34';
     return `
-      <div class="shuttle-card${tintedClass}" style="--route-color: ${routeColor}" data-vehicle-id="${vehicle.id}">
-        <div class="bus-number">Bus #${vehicle.busNumber}</div>
-        <div class="route-name">${routeName}</div>
-        <div class="details">
-          <span class="passengers">👥 ${vehicle.passengers}/${vehicle.capacity} (${loadPercent}%)</span>
-          <span class="update">🕐 ${vehicle.lastUpdate}</span>
-        </div>
-      </div>
+      <button class="route-picker-item${on ? ' active' : ''}"
+              data-route-id="${routeId}" role="menuitemcheckbox"
+              aria-checked="${on}">
+        <span class="route-picker-color" style="background:${color}"></span>
+        <span class="provider-chip">${chip}</span>
+        <span class="route-picker-name">${route.name}</span>
+        <span class="route-picker-check">✓</span>
+      </button>
     `;
   }).join('');
-  
-  // Add click handlers to center map on vehicle
-  container.querySelectorAll('.shuttle-card').forEach(card => {
-    card.addEventListener('click', () => {
-      const vehicleId = card.dataset.vehicleId;
-      const vehicle = vehicles.find(v => v.id === vehicleId);
-      if (vehicle) {
-        state.map.setView([vehicle.latitude, vehicle.longitude], 17);
-        const marker = state.markers.get(vehicleId);
-        if (marker) {
-          marker.openPopup();
-        }
-      }
+
+  list.innerHTML = html;
+
+  // Toggle route on/off when a row is tapped.
+  list.querySelectorAll('.route-picker-item').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const routeId = btn.dataset.routeId;
+      const wasOn = state.routeDisplay.get(routeId) === true;
+      state.routeDisplay.set(routeId, !wasOn);
+      saveRouteDisplayPrefs();
+
+      // Update the button's own visual state immediately so the user
+      // sees the checkmark toggle without waiting for a full re-render.
+      btn.classList.toggle('active', !wasOn);
+      btn.setAttribute('aria-checked', String(!wasOn));
+
+      updateRouteDisplay();
+      fitMapToVisibleRoutes({ animate: true });
     });
   });
 }
 
 /**
- * Render route filters in the sidebar
+ * Wire up the floating route-selection button (FAB) and the picker
+ * popover. The FAB toggles the popover on tap; tapping anywhere else
+ * on the map closes it. Replaces the old bottom-sheet sidebar that
+ * housed the shuttle list + route filters.
  */
-function renderRouteFilters() {
-  const container = document.getElementById('route-filters');
+function initRouteFab() {
+  const fab = document.getElementById('route-fab');
+  const picker = document.getElementById('route-picker');
+  if (!fab || !picker) return;
 
-  // Sidebar only lists routes that are currently running — inactive routes
-  // clutter the list with options that can't show any live buses. The
-  // pin picker is where users can still reach them to pre-pin a stop.
-  const routesHtml = state.routes.filter(r => r.active !== false).map(route => {
-    const routeIdStr = String(route.myid);
-    const isShowing = state.routeDisplay.get(routeIdStr) === true;
-    const chip = chipFor(routeIdStr);
-    return `
-      <div class="route-filter ${isShowing ? 'active' : ''}">
-        <button class="route-toggle-btn" data-route-id="${routeIdStr}" title="Show/hide route path and stops">
-          <span class="provider-chip">${chip}</span>
-          <span class="route-color" style="background: ${route.color}"></span>
-          <span class="route-name">${route.name}</span>
-          <span class="route-toggle-icon">${isShowing ? '🗺️' : '○'}</span>
-        </button>
-      </div>
-    `;
-  }).join('');
-  
-  const helperText = `<p class="route-helper-text">Click a route to show its path and stops on the map</p>`;
-  
-  container.innerHTML = helperText + `<div class="routes-list">${routesHtml}</div>`;
-  
-  // Add route toggle handlers
-  container.querySelectorAll('.route-toggle-btn').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      const routeId = btn.dataset.routeId;
-      const currentState = state.routeDisplay.get(routeId) === true;
-      state.routeDisplay.set(routeId, !currentState);
-      
-      // Save to localStorage
-      saveRouteDisplayPrefs();
-      
-      // Update button appearance
-      const filterDiv = btn.closest('.route-filter');
-      filterDiv.classList.toggle('active', !currentState);
-      btn.querySelector('.route-toggle-icon').textContent = !currentState ? '🗺️' : '○';
-      
-      // Update map display
-      updateRouteDisplay();
+  fab.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const willOpen = picker.classList.contains('hidden');
+    picker.classList.toggle('hidden');
+    if (willOpen) {
+      // Re-render so the check marks match the current display state
+      // (user may have toggled routes via some other path, like the
+      // pin picker, since the last render).
+      renderRoutePicker();
+    }
+  });
 
-      // Reframe the map so the newly-toggled route is visible. Animated
-      // so the user can see the zoom transition as a direct result of
-      // their click, not a mysterious jump.
-      fitMapToVisibleRoutes({ animate: true });
-    });
+  // Close when tapping the backdrop (the overlay itself, not the card).
+  picker.addEventListener('click', (e) => {
+    if (e.target === picker) picker.classList.add('hidden');
+  });
+
+  // Close via the × button.
+  const closeBtn = picker.querySelector('.route-picker-close');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => picker.classList.add('hidden'));
+  }
+
+  // Close on Escape.
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !picker.classList.contains('hidden')) {
+      picker.classList.add('hidden');
+    }
   });
 }
 
@@ -1958,7 +1979,6 @@ async function updateData() {
     state.vehicles = vehicles;
 
     updateVehicleMarkers(state.vehicles);
-    renderShuttleList(state.vehicles);
     renderPinnedPanel();
 
     const now = new Date().toLocaleTimeString();
@@ -1975,107 +1995,9 @@ async function updateData() {
   }
 }
 
-/**
- * Initialize mobile bottom sheet behavior with drag support
- */
-function initMobileSheet() {
-  const sidebar = document.getElementById('sidebar');
-  const handle = document.getElementById('sidebar-handle');
-  
-  if (!sidebar || !handle) return;
-  
-  // Check if mobile
-  const isMobile = () => window.innerWidth <= 768;
-  
-  // Start collapsed on mobile
-  if (isMobile()) {
-    sidebar.classList.add('collapsed');
-  }
-  
-  // Drag state
-  let isDragging = false;
-  let startY = 0;
-  let startTranslate = 0;
-  let currentTranslate = 0;
-  
-  // Get the collapsed translate value
-  const getCollapsedTranslate = () => {
-    const sidebarHeight = sidebar.offsetHeight;
-    const handleHeight = 70; // Handle visible height when collapsed
-    return sidebarHeight - handleHeight;
-  };
-  
-  // Touch start
-  handle.addEventListener('touchstart', (e) => {
-    if (!isMobile()) return;
-    
-    isDragging = true;
-    startY = e.touches[0].clientY;
-    
-    // Get current translate value
-    const isCollapsed = sidebar.classList.contains('collapsed');
-    startTranslate = isCollapsed ? getCollapsedTranslate() : 0;
-    currentTranslate = startTranslate;
-    
-    // Disable transition during drag
-    sidebar.style.transition = 'none';
-    sidebar.classList.remove('collapsed');
-  }, { passive: true });
-  
-  // Touch move
-  handle.addEventListener('touchmove', (e) => {
-    if (!isDragging) return;
-    
-    const deltaY = e.touches[0].clientY - startY;
-    currentTranslate = Math.max(0, Math.min(getCollapsedTranslate(), startTranslate + deltaY));
-    
-    sidebar.style.transform = `translateY(${currentTranslate}px)`;
-  }, { passive: true });
-  
-  // Touch end
-  handle.addEventListener('touchend', () => {
-    if (!isDragging) return;
-    isDragging = false;
-    
-    // Re-enable transition
-    sidebar.style.transition = '';
-    sidebar.style.transform = '';
-    
-    // Snap to expanded or collapsed based on position
-    const threshold = getCollapsedTranslate() * 0.4;
-    if (currentTranslate > threshold) {
-      sidebar.classList.add('collapsed');
-    } else {
-      sidebar.classList.remove('collapsed');
-    }
-  });
-  
-  // Also support click for accessibility
-  handle.addEventListener('click', (e) => {
-    // Only toggle on click if it wasn't a drag
-    if (!isDragging && isMobile()) {
-      sidebar.classList.toggle('collapsed');
-    }
-  });
-  
-  // Handle window resize
-  window.addEventListener('resize', () => {
-    if (!isMobile()) {
-      sidebar.classList.remove('collapsed');
-      sidebar.style.transform = '';
-    }
-  });
-}
-
-/**
- * Update shuttle count label
- */
-function updateShuttleCount(count) {
-  const label = document.getElementById('shuttle-count');
-  if (label) {
-    label.textContent = count === 1 ? '1 Active Shuttle' : `${count} Active Shuttles`;
-  }
-}
+/* initMobileSheet and updateShuttleCount removed — the bottom-sheet
+   sidebar has been replaced by the floating route FAB + popover picker.
+   See initRouteFab() and renderRoutePicker(). */
 
 /**
  * Initialize refresh button
@@ -2420,9 +2342,6 @@ async function init() {
   // Initialize map
   initMap();
 
-  // Initialize mobile bottom sheet
-  initMobileSheet();
-
   // Initialize refresh button
   initRefreshButton();
 
@@ -2431,6 +2350,16 @@ async function init() {
 
   // Wire the pin picker modal (route + stop selection)
   initPinPicker();
+
+  // Wire the floating route-selection FAB + popover
+  initRouteFab();
+
+  // Wire the dark/light map toggle and set its initial icon.
+  const themeBtn = document.getElementById('theme-toggle');
+  if (themeBtn) {
+    themeBtn.innerHTML = state.mapTheme === 'dark' ? sunSVG : moonSVG;
+    themeBtn.addEventListener('click', toggleMapTheme);
+  }
 
   // Load the persisted pinned stop (or default to Grad Junction West on first visit)
   state.pinnedStop = loadPinnedStop();
@@ -2479,7 +2408,7 @@ async function init() {
       state.routeDisplay.set(routeId, savedPrefs[routeId] === true);
     });
 
-    renderRouteFilters();
+    renderRoutePicker();
 
     // Draw route lines and stops
     updateRouteDisplay();
