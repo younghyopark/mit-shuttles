@@ -31,9 +31,10 @@ const MAP_THEME_KEY = 'mit-shuttle-map-theme';
 // LocalStorage key for route display preferences
 const STORAGE_KEY = 'mit-shuttle-route-display';
 
-// LocalStorage key for the single pinned stop (singular in the new model)
-const PINNED_STOP_KEY = 'mit-shuttle-pinned-stop';
-// Legacy plural key for migration from the multi-pin model
+// LocalStorage key for pinned stops (array of up to 2)
+const PINNED_STOPS_KEY = 'mit-shuttle-pinned-stops-v2';
+// Legacy keys for migration
+const LEGACY_PINNED_STOP_KEY = 'mit-shuttle-pinned-stop';
 const LEGACY_PINNED_STOPS_KEY = 'mit-shuttle-pinned-stops';
 
 // LocalStorage key for display preferences (showNextStop, etc.)
@@ -42,9 +43,11 @@ const DISPLAY_PREFS_KEY = 'mit-shuttle-display-prefs';
 // Default focused route for first-time visitors: Tech Shuttle.
 const DEFAULT_FOCUSED_ROUTE_ID = 'mit:63220';
 
-// Default pinned stop for first-time visitors: "Grad Junction West" on Tech Shuttle.
-// Gives the user an immediately useful arrival panel on first load.
-const DEFAULT_PINNED_STOP = { routeId: 'mit:63220', stopId: '180113' };
+// Default pinned stops for first-time visitors.
+const DEFAULT_PINNED_STOPS = [
+  { routeId: 'mit:63220',      stopId: '180113' }, // Grad Junction West — Tech Shuttle
+  { routeId: 'longwood:67526', stopId: '207817' }, // Mass Ave at MIT (Northbound) — M2
+];
 
 // Application state
 const state = {
@@ -69,30 +72,21 @@ const state = {
   // projector from jumping between lollipop-segment candidates between polls.
   lastBusPolyIdx: new Map(),  // `${routeId}:${busId}` -> { polyIdx, time }
   // Authoritative per-bus stop positions from Passio's rich ETA shape.
-  // Populated by refreshPinnedRoutePositions() before each render. When
-  // present, this short-circuits all GPS projection logic in
-  // computeBusFractionalIndex — we trust Passio's "bus is approaching
-  // stop N" answer directly instead of guessing it from lat/lng. Keyed
-  // by prefixed routeId at the outer level, bus fleet number inside.
-  busRoutePositions: new Map(),  // routeId -> Map<busName, positionRecord>
-  busRoutePositionsFetchedAtMs: 0,
-  pinnedStop: null,           // Single { routeId, stopId } or null
+  // Per-slot arrays (up to 2 pinned stops). Each slot's Map is keyed by
+  // prefixed routeId at the outer level, bus fleet number inside.
+  busRoutePositions: [new Map(), new Map()],
+  busRoutePositionsFetchedAtMs: [0, 0],
+  pinnedStops: [null, null],  // Up to 2 pinned stops, each { routeId, stopId } or null
   displayPrefs: { showNextStop: true }, // User display preferences (persisted)
   lastBusFrac: new Map(),     // `${routeId}:${busId}` -> { frac, time } for smoothing
-  // ETAs for the currently pinned stop. Repopulated on every updateData cycle
-  // when a stop is pinned, and cleared when the pin changes. Callers look up
-  // ETAs by bus fleet number via `byBusName` because that's the only field
-  // Passio's ETA endpoint guarantees across both of its response shapes.
-  pinnedEtas: {
-    routeId: null,            // prefixed, matches state.pinnedStop.routeId
-    stopId:  null,
-    fetchedAtMs: 0,
-    byBusName: new Map(),     // bus fleet number -> ETA record
-    list: [],                 // sorted-soonest-first array, for overflow rendering
-  },
+  // ETAs for each pinned stop slot. Repopulated on every updateData cycle.
+  pinnedEtas: [
+    { routeId: null, stopId: null, fetchedAtMs: 0, byBusName: new Map(), list: [] },
+    { routeId: null, stopId: null, fetchedAtMs: 0, byBusName: new Map(), list: [] },
+  ],
   updateTimer: null,
   etaTickTimer: null,         // 1s tick that advances ETA countdowns in place
-  pinnedEtasInFlight: 0,      // monotonic token to discard stale ETA responses
+  pinnedEtasInFlight: [0, 0], // per-slot monotonic token to discard stale ETA responses
 };
 
 /**
@@ -220,45 +214,62 @@ function chipFor(prefixedRouteId) {
 }
 
 /**
- * Load the single pinned stop from localStorage.
- * - Migrates any legacy plural-array format by taking the first entry.
- * - First-time visitors (no saved state) get the default pin.
- * - Returns null only if the user has explicitly cleared their pin.
+ * Load pinned stops from localStorage. Returns [slot0, slot1] where each
+ * is { routeId, stopId } or null. Migrates legacy single-pin keys.
  */
-function loadPinnedStop() {
-  // Migrate any legacy plural key written by the old multi-pin model.
-  const legacy = localStorage.getItem(LEGACY_PINNED_STOPS_KEY);
-  if (legacy !== null) {
+function loadPinnedStops() {
+  // Try the current v2 key first.
+  const saved = localStorage.getItem(PINNED_STOPS_KEY);
+  if (saved !== null) {
     try {
-      const arr = JSON.parse(legacy);
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed)) {
+        const result = [null, null];
+        for (let i = 0; i < 2; i++) {
+          const p = parsed[i];
+          if (p && typeof p.routeId === 'string' && typeof p.stopId === 'string') {
+            result[i] = p;
+          }
+        }
+        return result;
+      }
+    } catch (e) {
+      console.warn('Could not load pinned stops:', e);
+    }
+  }
+
+  // Migrate from legacy single-pin key.
+  const legacySingle = localStorage.getItem(LEGACY_PINNED_STOP_KEY);
+  if (legacySingle !== null) {
+    localStorage.removeItem(LEGACY_PINNED_STOP_KEY);
+    try {
+      const parsed = JSON.parse(legacySingle);
+      if (parsed && typeof parsed.routeId === 'string' && typeof parsed.stopId === 'string') {
+        const result = [parsed, null];
+        localStorage.setItem(PINNED_STOPS_KEY, JSON.stringify(result));
+        return result;
+      }
+      return [null, null];
+    } catch { /* fall through */ }
+  }
+
+  // Migrate from legacy plural key.
+  const legacyPlural = localStorage.getItem(LEGACY_PINNED_STOPS_KEY);
+  if (legacyPlural !== null) {
+    localStorage.removeItem(LEGACY_PINNED_STOPS_KEY);
+    try {
+      const arr = JSON.parse(legacyPlural);
       if (Array.isArray(arr) && arr.length > 0 &&
           arr[0] && typeof arr[0].routeId === 'string' && typeof arr[0].stopId === 'string') {
-        localStorage.setItem(PINNED_STOP_KEY, JSON.stringify(arr[0]));
+        const result = [arr[0], null];
+        localStorage.setItem(PINNED_STOPS_KEY, JSON.stringify(result));
+        return result;
       }
-    } catch {
-      // ignore parse failures
-    }
-    localStorage.removeItem(LEGACY_PINNED_STOPS_KEY);
+    } catch { /* fall through */ }
   }
-
-  const saved = localStorage.getItem(PINNED_STOP_KEY);
 
   // First-time visitor: seed with the default pin.
-  if (saved === null) {
-    return { ...DEFAULT_PINNED_STOP };
-  }
-
-  try {
-    const parsed = JSON.parse(saved);
-    if (parsed && typeof parsed.routeId === 'string' && typeof parsed.stopId === 'string') {
-      return parsed;
-    }
-    // Explicit "null" saved means the user cleared their pin.
-    return null;
-  } catch (e) {
-    console.warn('Could not load pinned stop:', e);
-    return null;
-  }
+  return [DEFAULT_PINNED_STOPS[0], DEFAULT_PINNED_STOPS[1]];
 }
 
 /**
@@ -285,73 +296,127 @@ function saveDisplayPrefs() {
 }
 
 /**
- * Persist the current state.pinnedStop. Writes `null` (as a string) when
- * cleared so load can distinguish "user cleared" from "first-time visit".
+ * Persist pinned stops array to localStorage.
  */
-function savePinnedStop() {
+function savePinnedStops() {
   try {
-    localStorage.setItem(PINNED_STOP_KEY, JSON.stringify(state.pinnedStop));
+    localStorage.setItem(PINNED_STOPS_KEY, JSON.stringify(state.pinnedStops));
   } catch (e) {
-    console.warn('Could not save pinned stop:', e);
+    console.warn('Could not save pinned stops:', e);
   }
 }
 
 /**
- * Is this (routeId, stopId) the currently pinned stop?
+ * Clear ETA and position state for a single pinned-stop slot.
+ */
+function clearSlotState(i) {
+  state.pinnedEtasInFlight[i]++;
+  state.pinnedEtas[i].routeId = null;
+  state.pinnedEtas[i].stopId  = null;
+  state.pinnedEtas[i].byBusName.clear();
+  state.pinnedEtas[i].list = [];
+  state.pinnedEtas[i].fetchedAtMs = 0;
+  state.busRoutePositions[i] = new Map();
+  state.busRoutePositionsFetchedAtMs[i] = 0;
+}
+
+/**
+ * Is this (routeId, stopId) pinned in any slot?
  */
 function isStopPinned(routeId, stopId) {
-  return !!state.pinnedStop &&
-    state.pinnedStop.routeId === routeId &&
-    state.pinnedStop.stopId === stopId;
+  return state.pinnedStops.some(p =>
+    p && p.routeId === routeId && p.stopId === stopId
+  );
 }
 
 /**
- * Pin a (routeId, stopId). Replaces any existing pin.
+ * Find the slot index for a pinned (routeId, stopId), or -1.
+ */
+function pinnedSlotIndex(routeId, stopId) {
+  return state.pinnedStops.findIndex(p =>
+    p && p.routeId === routeId && p.stopId === stopId
+  );
+}
+
+/**
+ * How many stops are currently pinned?
+ */
+function pinnedCount() {
+  return state.pinnedStops.filter(Boolean).length;
+}
+
+/**
+ * Pin a (routeId, stopId). Fills the first empty slot, or replaces slot 1
+ * if both are full. No-op if already pinned.
  */
 function pinStop(routeId, stopId) {
-  state.pinnedStop = { routeId, stopId };
-  // Discard ETAs from the previous pin so the panel doesn't flash stale
-  // minutes from the old stop. Bumping the in-flight token also orphans
-  // any mid-flight fetch from the previous pin.
-  state.pinnedEtasInFlight++;
-  state.pinnedEtas.routeId = null;
-  state.pinnedEtas.stopId  = null;
-  state.pinnedEtas.byBusName.clear();
-  state.pinnedEtas.list = [];
-  state.pinnedEtas.fetchedAtMs = 0;
-  // Also clear stale server-position data from the previous pin's route
-  // so the panel doesn't briefly show the old route's bus positions
-  // against the new route's stop list.
-  state.busRoutePositions = new Map();
-  state.busRoutePositionsFetchedAtMs = 0;
-  // Kick off immediate fetches for the new pin so the user doesn't wait
-  // up to 5s for the next poll. Both are fire-and-forget; neither throws.
-  refreshPinnedEtas({ renderOnSuccess: true });
-  refreshPinnedRoutePositions().then(renderPinnedPanel);
-  savePinnedStop();
-  renderPinnedPanel();
+  if (isStopPinned(routeId, stopId)) return;
+
+  // Find the target slot: first empty, or slot 1 as overflow.
+  let slot = state.pinnedStops[0] === null ? 0
+           : state.pinnedStops[1] === null ? 1
+           : 1; // both full → replace slot 1
+
+  state.pinnedStops[slot] = { routeId, stopId };
+  clearSlotState(slot);
+
+  // Kick off immediate fetches for the new slot.
+  refreshPinnedEtasForSlot(slot, { renderOnSuccess: true });
+  refreshPinnedRoutePositionsForSlot(slot).then(renderPinnedPanels);
+  savePinnedStops();
+  renderPinnedPanels();
 }
 
 /**
- * Clear the pinned stop (whether it matches the given args or not — the
- * one-pin model has nothing else to unpin). Saves + re-renders.
+ * Replace a specific slot with a new (routeId, stopId). Used by the pin
+ * picker's edit flow where the user is editing a specific panel.
  */
-function unpinStop() {
-  if (state.pinnedStop === null) return;
-  state.pinnedStop = null;
-  // Clear ETA state and orphan any in-flight fetch.
-  state.pinnedEtasInFlight++;
-  state.pinnedEtas.routeId = null;
-  state.pinnedEtas.stopId  = null;
-  state.pinnedEtas.byBusName.clear();
-  state.pinnedEtas.list = [];
-  state.pinnedEtas.fetchedAtMs = 0;
-  // And clear server-position data so downstream consumers (stop
-  // popups for the old route) fall back to polyline projection.
-  state.busRoutePositions = new Map();
-  state.busRoutePositionsFetchedAtMs = 0;
-  savePinnedStop();
-  renderPinnedPanel();
+function replacePinSlot(slot, routeId, stopId) {
+  state.pinnedStops[slot] = { routeId, stopId };
+  clearSlotState(slot);
+  refreshPinnedEtasForSlot(slot, { renderOnSuccess: true });
+  refreshPinnedRoutePositionsForSlot(slot).then(renderPinnedPanels);
+  savePinnedStops();
+  renderPinnedPanels();
+}
+
+/**
+ * Unpin a specific (routeId, stopId). If slot 0 is removed and slot 1
+ * exists, shift slot 1 → slot 0 to keep the array compact.
+ */
+function unpinStop(routeId, stopId) {
+  const slot = pinnedSlotIndex(routeId, stopId);
+  if (slot === -1) return;
+
+  state.pinnedStops[slot] = null;
+  clearSlotState(slot);
+
+  // Compact: if slot 0 was removed and slot 1 exists, shift it up.
+  if (slot === 0 && state.pinnedStops[1] !== null) {
+    state.pinnedStops[0] = state.pinnedStops[1];
+    state.pinnedStops[1] = null;
+    // Move the ETA/position state for slot 1 → slot 0
+    state.pinnedEtas[0] = state.pinnedEtas[1];
+    state.pinnedEtas[1] = { routeId: null, stopId: null, fetchedAtMs: 0, byBusName: new Map(), list: [] };
+    state.pinnedEtasInFlight[0] = state.pinnedEtasInFlight[1];
+    state.pinnedEtasInFlight[1] = 0;
+    state.busRoutePositions[0] = state.busRoutePositions[1];
+    state.busRoutePositions[1] = new Map();
+    state.busRoutePositionsFetchedAtMs[0] = state.busRoutePositionsFetchedAtMs[1];
+    state.busRoutePositionsFetchedAtMs[1] = 0;
+  }
+
+  savePinnedStops();
+  renderPinnedPanels();
+}
+
+/**
+ * Clear a slot by index.
+ */
+function unpinSlot(slot) {
+  const p = state.pinnedStops[slot];
+  if (!p) return;
+  unpinStop(p.routeId, p.stopId);
 }
 
 /**
@@ -1001,11 +1066,19 @@ function computeBusFractionalIndex(bus, stops, routeId) {
   // exactly which stop each bus is servicing next — no GPS projection
   // needed. This is what fixes the lollipop-pass confusion cleanly.
   let rawFrac = null;
-  const positionsForRoute = state.busRoutePositions.get(routeId);
+  // Check both pinned-stop slots for authoritative position data.
+  const positionsForRoute = state.busRoutePositions[0]?.get(routeId)
+                         || state.busRoutePositions[1]?.get(routeId);
   if (positionsForRoute && bus.busNumber != null) {
     const pos = positionsForRoute.get(String(bus.busNumber));
-    if (pos && Number.isFinite(pos.routeStopPosition)) {
-      rawFrac = fracIdxFromServerPosition(pos, routeId, M);
+    if (pos) {
+      // MBTA adapter attaches _mbtaStopId — resolve it to our stop-list index.
+      if (pos._mbtaStopId) {
+        const idx = stops.findIndex(s => String(s.id) === String(pos._mbtaStopId));
+        if (idx !== -1) rawFrac = idx;
+      } else if (Number.isFinite(pos.routeStopPosition)) {
+        rawFrac = fracIdxFromServerPosition(pos, routeId, M);
+      }
     }
   }
 
@@ -1124,6 +1197,13 @@ function rawRouteIdFromPrefixed(routeId) {
   return i === -1 ? s : s.slice(i + 1);
 }
 
+function systemKeyFromPrefixed(routeId) {
+  if (routeId == null) return null;
+  const s = String(routeId);
+  const i = s.indexOf(':');
+  return i === -1 ? null : s.slice(0, i);
+}
+
 /**
  * Format a live ETA countdown for display on a bus icon. The caller is
  * expected to have already computed `seconds` from the stored
@@ -1164,9 +1244,9 @@ function formatEtaLabel(seconds) {
  *                               // UI dims it so the user can discount it
  *   }
  */
-function etaForBus(bus) {
+function etaForBus(bus, slot = 0) {
   if (!bus || !bus.busNumber) return null;
-  const e = state.pinnedEtas.byBusName.get(String(bus.busNumber));
+  const e = state.pinnedEtas[slot].byBusName.get(String(bus.busNumber));
   if (!e) return null;
   const stale = e.updatedSecAgo != null && e.updatedSecAgo > 90;
   return {
@@ -1174,6 +1254,23 @@ function etaForBus(bus) {
     solid: !!e.solid,
     stale,
   };
+}
+
+/**
+ * Check whether an ETA is physically plausible given how many stops
+ * the bus still has to traverse. Tech Shuttle segments take at minimum
+ * ~25-30 seconds even in ideal conditions (decelerate, dwell, accelerate).
+ * If the ETA implies less than 25 seconds per stop AND the bus is 3+
+ * stops out, the prediction is almost certainly stale or broken — flag
+ * it so the UI can dim it instead of showing a misleadingly precise
+ * countdown.
+ *
+ * Returns true (plausible) when we don't have enough data to judge.
+ */
+function isEtaPlausible(stopsAway, secondsUntil) {
+  if (stopsAway == null || secondsUntil == null) return true;
+  if (stopsAway < 3) return true; // too close to judge
+  return secondsUntil / stopsAway >= 25;
 }
 
 /**
@@ -1188,72 +1285,82 @@ function etaForBus(bus) {
  * still fall back to the polyline projection, which handles lollipop cases
  * reasonably well and is free (no extra network round-trip).
  */
-async function refreshPinnedRoutePositions() {
-  const pinned = state.pinnedStop;
+async function refreshPinnedRoutePositionsForSlot(i) {
+  const pinned = state.pinnedStops[i];
   if (!pinned) {
-    // Clear stale data when nothing is pinned. Other consumers still get
-    // the polyline-projection fallback for any route they care about.
-    state.busRoutePositions = new Map();
-    state.busRoutePositionsFetchedAtMs = 0;
+    state.busRoutePositions[i] = new Map();
+    state.busRoutePositionsFetchedAtMs[i] = 0;
     return;
   }
+  const sysKey = systemKeyFromPrefixed(pinned.routeId);
   const rawRouteId = rawRouteIdFromPrefixed(pinned.routeId);
-  const list = await fetchRoutePositions(rawRouteId);
+  const list = await fetchRoutePositions(sysKey, rawRouteId);
 
   // If the pin changed while this fetch was in flight, don't overwrite.
-  if (!state.pinnedStop || state.pinnedStop.routeId !== pinned.routeId) return;
+  if (!state.pinnedStops[i] || state.pinnedStops[i].routeId !== pinned.routeId) return;
 
   const byBusName = new Map();
   for (const p of list) byBusName.set(p.busName, p);
 
   const next = new Map();
   next.set(pinned.routeId, byBusName);
-  state.busRoutePositions = next;
-  state.busRoutePositionsFetchedAtMs = Date.now();
+  state.busRoutePositions[i] = next;
+  state.busRoutePositionsFetchedAtMs[i] = Date.now();
+}
+
+/** Refresh route positions for all pinned slots in parallel. */
+async function refreshPinnedRoutePositions() {
+  await Promise.all([
+    refreshPinnedRoutePositionsForSlot(0),
+    refreshPinnedRoutePositionsForSlot(1),
+  ]);
 }
 
 /**
- * Kick off an ETA fetch for the currently pinned stop. Uses a monotonic
- * token so that if the user changes the pin mid-fetch, the stale response
- * is discarded instead of overwriting the newer one. Never throws.
- *
- * When `renderOnSuccess` is true, re-renders the pinned panel as soon as
- * the fetch lands so the user sees fresh minutes without waiting for the
- * next poll tick. Used for the immediate fetch on pin change.
+ * ETA fetch for a single slot. Uses a per-slot monotonic token so a
+ * pin change mid-fetch discards the stale response. Never throws.
  */
-async function refreshPinnedEtas({ renderOnSuccess = false } = {}) {
-  const pinned = state.pinnedStop;
+async function refreshPinnedEtasForSlot(i, { renderOnSuccess = false } = {}) {
+  const pinned = state.pinnedStops[i];
   if (!pinned) {
-    // Clear any stale data if nothing's pinned.
-    state.pinnedEtas.routeId = null;
-    state.pinnedEtas.stopId  = null;
-    state.pinnedEtas.byBusName.clear();
-    state.pinnedEtas.list = [];
-    state.pinnedEtas.fetchedAtMs = 0;
+    state.pinnedEtas[i].routeId = null;
+    state.pinnedEtas[i].stopId  = null;
+    state.pinnedEtas[i].byBusName.clear();
+    state.pinnedEtas[i].list = [];
+    state.pinnedEtas[i].fetchedAtMs = 0;
     return;
   }
-  const token = ++state.pinnedEtasInFlight;
+  const token = ++state.pinnedEtasInFlight[i];
+  const sysKey = systemKeyFromPrefixed(pinned.routeId);
   const rawRouteId = rawRouteIdFromPrefixed(pinned.routeId);
   const stopId = String(pinned.stopId);
 
-  const etas = await fetchStopETAs(rawRouteId, stopId);
+  const etas = await fetchStopETAs(sysKey, rawRouteId, stopId);
 
   // Discard if a newer fetch was started, or the user unpinned/repinned.
-  if (token !== state.pinnedEtasInFlight) return;
-  if (!state.pinnedStop) return;
-  if (state.pinnedStop.routeId !== pinned.routeId) return;
-  if (state.pinnedStop.stopId  !== pinned.stopId)  return;
+  if (token !== state.pinnedEtasInFlight[i]) return;
+  if (!state.pinnedStops[i]) return;
+  if (state.pinnedStops[i].routeId !== pinned.routeId) return;
+  if (state.pinnedStops[i].stopId  !== pinned.stopId)  return;
 
-  state.pinnedEtas.routeId = pinned.routeId;
-  state.pinnedEtas.stopId  = stopId;
-  state.pinnedEtas.fetchedAtMs = Date.now();
-  state.pinnedEtas.list = etas;
-  state.pinnedEtas.byBusName.clear();
+  state.pinnedEtas[i].routeId = pinned.routeId;
+  state.pinnedEtas[i].stopId  = stopId;
+  state.pinnedEtas[i].fetchedAtMs = Date.now();
+  state.pinnedEtas[i].list = etas;
+  state.pinnedEtas[i].byBusName.clear();
   for (const e of etas) {
-    state.pinnedEtas.byBusName.set(String(e.busName), e);
+    state.pinnedEtas[i].byBusName.set(String(e.busName), e);
   }
 
-  if (renderOnSuccess) renderPinnedPanel();
+  if (renderOnSuccess) renderPinnedPanels();
+}
+
+/** Refresh ETAs for all pinned slots in parallel. */
+async function refreshPinnedEtas() {
+  await Promise.all([
+    refreshPinnedEtasForSlot(0),
+    refreshPinnedEtasForSlot(1),
+  ]);
 }
 
 /**
@@ -1270,7 +1377,11 @@ function updateEtaLabelsInPlace() {
     if (!Number.isFinite(arr)) continue;
     const seconds = (arr - nowMs) / 1000;
     const text = formatEtaLabel(seconds);
-    if (node.textContent !== text) node.textContent = text;
+    // Preserve the "~" prefix on suspect ETAs (it's part of the
+    // rendered text, not a separate element).
+    const prefix = node.classList.contains('suspect') ? '~' : '';
+    const full = prefix + text;
+    if (node.textContent !== full) node.textContent = full;
   }
 }
 
@@ -1335,11 +1446,11 @@ function createStopPopupContent(stopData) {
   }
 
   const pinnedHere = isStopPinned(routeId, stopId);
-  const somethingElsePinned = !pinnedHere && state.pinnedStop !== null;
+  const count = pinnedCount();
   let pinLabel;
   if (pinnedHere) {
     pinLabel = '📌 Unpin from top';
-  } else if (somethingElsePinned) {
+  } else if (count >= 2) {
     pinLabel = '📌 Pin this stop instead';
   } else {
     pinLabel = '📌 Pin to top';
@@ -1489,27 +1600,29 @@ function labelForTrackPos(trackPos) {
  * The ETA element carries its own `data-arrival-ms` so the 1-second tick
  * loop can advance the countdown without re-rendering the whole panel.
  */
-function renderTrackBusHTML(bus, labelText, trackPos, proximity, labelPosition) {
+function renderTrackBusHTML(bus, labelText, trackPos, proximity, labelPosition, stopsAway, slot = 0) {
   const busLabel = bus.busNumber || bus.id;
   const { span } = pinnedTrackLayout();
 
-  // Ratio across the track: 0 = far right, 1 = far left (6 prev stops).
   const rawRatio = span > 0 ? trackPos / span : 0;
   const ratio = Math.min(Math.max(rawRatio, 0), 1).toFixed(3);
 
-  // ETA subline, if Passio has one for this bus. We render the element
-  // whether or not we could compute text, because the tick loop updates
-  // it by attribute — text will appear on the next tick even if the first
-  // render is empty (shouldn't happen, but cheap to be safe).
-  const eta = etaForBus(bus);
+  const eta = etaForBus(bus, slot);
   let etaHtml = '';
   let titleExtra = '';
   if (eta) {
     const seconds = (eta.arrivalEpochMs - Date.now()) / 1000;
     const text = formatEtaLabel(seconds);
-    const etaClass = `track-bus-eta${eta.stale ? ' stale' : ''}${eta.solid ? '' : ' soft'}`;
-    etaHtml = `<div class="${etaClass}" data-arrival-ms="${eta.arrivalEpochMs}">${text}</div>`;
-    titleExtra = ` — ETA ${text}`;
+    const suspect = !isEtaPlausible(stopsAway, seconds);
+    const cls = [
+      'track-bus-eta',
+      eta.stale   ? 'stale'   : '',
+      !eta.solid  ? 'soft'    : '',
+      suspect     ? 'suspect' : '',
+    ].filter(Boolean).join(' ');
+    const prefix = suspect ? '~' : '';
+    etaHtml = `<div class="${cls}" data-arrival-ms="${eta.arrivalEpochMs}">${prefix}${text}</div>`;
+    titleExtra = ` — ETA ${suspect ? '~' : ''}${text}`;
   }
 
   return `
@@ -1533,11 +1646,19 @@ function renderTrackBusHTML(bus, labelText, trackPos, proximity, labelPosition) 
  * position derived from their actual geo coordinates. Buses further out are
  * listed as a text strip below the line.
  */
-function renderPinnedPanel() {
-  const panel = document.getElementById('pinned-panel');
+function renderPinnedPanels() {
+  for (let slot = 0; slot < 2; slot++) {
+    renderPinnedSlot(slot);
+  }
+}
+
+/** Render a single pinned-stop slot panel. */
+function renderPinnedSlot(slot) {
+  const panel = document.getElementById(`pinned-panel-${slot}`);
   if (!panel) return;
 
-  if (!state.pinnedStop) {
+  const pinned = state.pinnedStops[slot];
+  if (!pinned) {
     panel.classList.add('hidden');
     panel.innerHTML = '';
     return;
@@ -1545,7 +1666,7 @@ function renderPinnedPanel() {
 
   panel.classList.remove('hidden');
 
-  const { routeId, stopId } = state.pinnedStop;
+  const { routeId, stopId } = pinned;
   const info = computeStopArrivals(routeId, stopId);
   const routeInfo = state.routeData?.routeInfo[routeId] || {};
   const routeColor = routeInfo.color || '#a31f34';
@@ -1556,9 +1677,6 @@ function renderPinnedPanel() {
     ? `${info.routeName} · Stop ${info.stopIndex + 1} of ${info.totalStops}`
     : (routeInfo.name || 'Waiting for route data…');
 
-  // Partition each arrival into visible (has a track position) vs overflow
-  // (listed as text below the line). Track position already encodes both
-  // the approaching side and the "just departed" side relative to pinned.
   const totalStops = info?.totalStops || 0;
   const visible = [];
   const overflow = [];
@@ -1571,14 +1689,8 @@ function renderPinnedPanel() {
     }
   }
 
-  // Draw buses rightmost-first so label alternation (below/above) follows
-  // physical left-to-right adjacency on the track.
   visible.sort((a, b) => a.trackPos - b.trackPos);
 
-  // Stop dots for every integer slot along the track, skipping the slot
-  // where the vertical bar (pinned stop) sits. The "next stop" dot (when
-  // enabled) lives at position 0 (far right) so the pinned slot reads as
-  // a point in a sequence rather than a dead-end.
   const layout = pinnedTrackLayout();
   let prevDotsHtml = '';
   for (let n = 0; n <= layout.span; n++) {
@@ -1587,21 +1699,14 @@ function renderPinnedPanel() {
     prevDotsHtml += `<div class="track-prev-dot" style="--offset-ratio: ${ratio}"></div>`;
   }
 
-  // Bus markers. Labels alternate below/above so adjacent labels don't
-  // collide. The label text comes from trackPos (so the "just departed"
-  // region gets "leaving" / "next stop" instead of misleading big numbers).
   let busesHtml = '';
   visible.forEach(({ bus, stopsAway, trackPos }, idx) => {
     const labelPosition = idx % 2 === 0 ? 'below' : 'above';
     const labelText = labelForTrackPos(trackPos);
     const proximity = classifyBusProximity(stopsAway);
-    busesHtml += renderTrackBusHTML(bus, labelText, trackPos, proximity, labelPosition);
+    busesHtml += renderTrackBusHTML(bus, labelText, trackPos, proximity, labelPosition, stopsAway, slot);
   });
 
-  // Single aggregate marker for every bus beyond the 6-stop window,
-  // pinned to the far-left of the track and labeled "6+ stops". One icon
-  // no matter how many buses are out there — just a hint that more are
-  // coming from further away.
   if (overflow.length > 0) {
     const overflowLabelPos = visible.length % 2 === 0 ? 'below' : 'above';
     const overflowTitle = overflow.length === 1
@@ -1617,33 +1722,32 @@ function renderPinnedPanel() {
     `;
   }
 
-  // Empty-state message only when there are genuinely no buses anywhere
-  // (nothing visible AND nothing beyond the window).
   let emptyHtml = '';
   if (visible.length === 0 && overflow.length === 0) {
     emptyHtml = `<div class="track-empty">No active buses on this route</div>`;
   }
 
-  // Text list under the track detailing each bus beyond the 6-stop window.
-  // The 6+ marker on the line is the summary; this row gives the actual
-  // stops-away numbers so the user still knows how far out they are. When
-  // Passio has a live ETA for the bus we tack it on in parentheses, with
-  // its own data-arrival-ms so the tick loop keeps the minutes fresh.
   let overflowHtml = '';
   if (overflow.length > 0) {
     const parts = overflow.map(({ bus, stopsAway }) => {
       const stopsText = formatStopsAwayText(stopsAway);
-      const eta = etaForBus(bus);
+      const eta = etaForBus(bus, slot);
       if (!eta) return `<span class="overflow-item">${stopsText}</span>`;
       const seconds = (eta.arrivalEpochMs - Date.now()) / 1000;
       const text = formatEtaLabel(seconds);
-      const cls = `overflow-eta${eta.stale ? ' stale' : ''}${eta.solid ? '' : ' soft'}`;
-      return `<span class="overflow-item">${stopsText} <span class="${cls}" data-arrival-ms="${eta.arrivalEpochMs}">${text}</span></span>`;
+      const suspect = !isEtaPlausible(stopsAway, seconds);
+      const cls = [
+        'overflow-eta',
+        eta.stale   ? 'stale'   : '',
+        !eta.solid  ? 'soft'    : '',
+        suspect     ? 'suspect' : '',
+      ].filter(Boolean).join(' ');
+      const prefix = suspect ? '~' : '';
+      return `<span class="overflow-item">${stopsText} <span class="${cls}" data-arrival-ms="${eta.arrivalEpochMs}">${prefix}${text}</span></span>`;
     });
     overflowHtml = `<div class="pinned-overflow"><span class="overflow-prefix">Also approaching:</span> ${parts.join(' · ')}</div>`;
   }
 
-  // Destination pulses when a bus is 0 or 1 stops away.
   const anyArriving = visible.some(a => a.stopsAway === 0 || a.stopsAway === 1);
   const trackClass = `pinned-track${anyArriving ? ' arriving' : ''}`;
 
@@ -1654,7 +1758,7 @@ function renderPinnedPanel() {
         <div class="pinned-stop-name" title="${stopName}">${stopName}</div>
         <div class="pinned-subtitle">${subtitle}</div>
       </div>
-      <button class="edit-pin-btn" aria-label="Change pinned stop">
+      <button class="edit-pin-btn" data-slot="${slot}" aria-label="Change pinned stop">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
           <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
@@ -1986,7 +2090,7 @@ async function updateData() {
     state.vehicles = vehicles;
 
     updateVehicleMarkers(state.vehicles);
-    renderPinnedPanel();
+    renderPinnedPanels();
 
     const now = new Date().toLocaleTimeString();
     if (errors.length > 0) {
@@ -2040,21 +2144,20 @@ const pickerState = {
   step: 'routes',              // 'routes' | 'stops'
   selectedRouteId: null,
   inactiveExpanded: false,     // "Not running now" collapsible section state
+  targetSlot: 0,               // Which pinned-stop slot this picker edits
 };
 
 /**
- * Open the picker on the route-selection step, highlighting whichever
- * route is currently pinned (if any). If the current pin is on an
- * inactive route, the "Not running now" section auto-expands so the
- * user immediately sees it.
+ * Open the picker on the route-selection step for a specific slot.
  */
-function openPinPicker() {
+function openPinPicker(slot = 0) {
   const picker = document.getElementById('pin-picker');
   if (!picker) return;
   pickerState.step = 'routes';
   pickerState.selectedRouteId = null;
+  pickerState.targetSlot = slot;
 
-  const pinnedRouteId = state.pinnedStop?.routeId;
+  const pinnedRouteId = state.pinnedStops[slot]?.routeId;
   const pinnedRoute = pinnedRouteId
     ? state.routes.find(r => r.myid === pinnedRouteId)
     : null;
@@ -2124,7 +2227,7 @@ function renderPinPickerRoutes() {
   back.classList.add('hidden');
   title.textContent = 'Select a route';
 
-  const pinnedRouteId = state.pinnedStop?.routeId || null;
+  const pinnedRouteId = state.pinnedStops[pickerState.targetSlot]?.routeId || null;
 
   const byNameCurrentFirst = (a, b) => {
     if (a.myid === pinnedRouteId && b.myid !== pinnedRouteId) return -1;
@@ -2150,11 +2253,11 @@ function renderPinPickerRoutes() {
     <div class="pin-picker-divider"></div>
   `;
 
-  if (state.pinnedStop) {
+  if (state.pinnedStops[pickerState.targetSlot]) {
     html += `
       <button class="pin-picker-row pin-picker-clear" data-pp-action="clear">
-        <span class="pin-picker-row-label">Clear current pin</span>
-        <span class="pin-picker-row-sub">Hides the approach panel</span>
+        <span class="pin-picker-row-label">Clear this pin</span>
+        <span class="pin-picker-row-sub">Hides this approach panel</span>
       </button>
     `;
   }
@@ -2212,9 +2315,8 @@ function renderPinPickerStops(routeId) {
   title.textContent = routeInfo.name || 'Select a stop';
 
   const stops = state.routeData?.stops[routeId] || [];
-  const pinnedStopId = state.pinnedStop?.routeId === routeId
-    ? state.pinnedStop.stopId
-    : null;
+  const slotPin = state.pinnedStops[pickerState.targetSlot];
+  const pinnedStopId = slotPin?.routeId === routeId ? slotPin.stopId : null;
 
   let html = '';
   stops.forEach((stop, idx) => {
@@ -2285,12 +2387,12 @@ function initPinPicker() {
       state.displayPrefs.showNextStop = !state.displayPrefs.showNextStop;
       saveDisplayPrefs();
       renderPinPickerRoutes();
-      renderPinnedPanel();
+      renderPinnedPanels();
       return;
     }
 
     if (row.dataset.ppAction === 'clear') {
-      unpinStop();
+      unpinSlot(pickerState.targetSlot);
       closePinPicker();
       return;
     }
@@ -2303,7 +2405,7 @@ function initPinPicker() {
 
     const stopId = row.dataset.ppStop;
     if (stopId && pickerState.selectedRouteId) {
-      pinStop(pickerState.selectedRouteId, stopId);
+      replacePinSlot(pickerState.targetSlot, pickerState.selectedRouteId, stopId);
       closePinPicker();
     }
   });
@@ -2315,10 +2417,12 @@ function initPinPicker() {
  */
 function initPinDelegation() {
   document.addEventListener('click', (e) => {
-    // Edit button on the pinned-panel card opens the route/stop picker.
+    // Edit button on a pinned-panel card opens the route/stop picker
+    // for that specific slot.
     const editBtn = e.target.closest('.pinned-panel .edit-pin-btn');
     if (editBtn) {
-      openPinPicker();
+      const slot = parseInt(editBtn.dataset.slot, 10) || 0;
+      openPinPicker(slot);
       return;
     }
 
@@ -2329,7 +2433,7 @@ function initPinDelegation() {
     const stopId = btn.dataset.pinStop;
 
     if (isStopPinned(routeId, stopId)) {
-      unpinStop();
+      unpinStop(routeId, stopId);
     } else {
       pinStop(routeId, stopId);
     }
@@ -2369,7 +2473,7 @@ async function init() {
   }
 
   // Load the persisted pinned stop (or default to Grad Junction West on first visit)
-  state.pinnedStop = loadPinnedStop();
+  state.pinnedStops = loadPinnedStops();
   state.displayPrefs = loadDisplayPrefs();
   
   try {
@@ -2424,7 +2528,7 @@ async function init() {
     await updateData();
 
     // Now that the pinned panel has been rendered (by updateData ->
-    // renderPinnedPanel), its DOM height is measurable — which means
+    // renderPinnedPanels), its DOM height is measurable — which means
     // fitMapToVisibleRoutes can pad around it correctly. Run it on
     // the next animation frame so any layout-affecting render from
     // updateData has already landed. No animation on first fit — the

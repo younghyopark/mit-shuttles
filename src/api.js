@@ -5,18 +5,21 @@
  */
 
 const BASE_URL = 'https://passiogo.com';
-
-// Passio GO sends Access-Control-Allow-Origin: * directly on responses,
-// so we can call it from the browser without a CORS proxy.
+const MBTA_BASE = 'https://api-v3.mbta.com';
 
 /**
- * All transit systems we pull data from. Keys ('mit', 'ezride') are used as
- * route-ID prefixes throughout the app to keep a flat, collision-free keyspace
- * even though each system numbers its routes independently.
+ * All transit systems we pull data from. Keys are used as route-ID prefixes
+ * throughout the app to keep a flat, collision-free keyspace.
+ *
+ * `type` determines which API backend to query:
+ *   - 'passio' (default) — Passio GO
+ *   - 'mbta'             — MBTA V3 REST API
  */
 export const SYSTEMS = {
-  mit:    { id: '94',   label: 'MIT',    chip: 'MIT' },
-  ezride: { id: '5019', label: 'EZRide', chip: 'EZR' },
+  mit:      { id: '94',   label: 'MIT',       chip: 'MIT',  type: 'passio' },
+  ezride:   { id: '5019', label: 'EZRide',    chip: 'EZR',  type: 'passio' },
+  longwood: { id: '6986', label: 'Longwood',   chip: 'LMA', type: 'passio', onlyRoutes: ['67526'] },
+  mbta1:    { label: 'MBTA', chip: 'T', type: 'mbta', mbtaRouteId: '1', onlyRoutes: ['1'] },
 };
 
 // Back-compat export for any code still referencing MIT_SYSTEM_ID directly.
@@ -80,6 +83,7 @@ function shouldShowRoute(rawRoute) {
 export async function fetchRoutes(systemKey) {
   const system = SYSTEMS[systemKey];
   if (!system) throw new Error(`Unknown system: ${systemKey}`);
+  if (system.type === 'mbta') return fetchRoutes_MBTA(systemKey);
 
   const data = await apiRequest('mapGetData.php?getRoutes=2', {
     systemSelected0: system.id,
@@ -89,6 +93,11 @@ export async function fetchRoutes(systemKey) {
   const rawRoutes = data.all || [];
   return rawRoutes
     .filter(shouldShowRoute)
+    .filter(route => {
+      // If the system defines an onlyRoutes whitelist, restrict to those IDs.
+      if (system.onlyRoutes) return system.onlyRoutes.includes(String(route.myid));
+      return true;
+    })
     .map(route => ({
       ...route,
       myid: prefixRouteId(systemKey, route.myid),
@@ -104,6 +113,7 @@ export async function fetchRoutes(systemKey) {
 export async function fetchVehicles(systemKey) {
   const system = SYSTEMS[systemKey];
   if (!system) throw new Error(`Unknown system: ${systemKey}`);
+  if (system.type === 'mbta') return fetchVehicles_MBTA(systemKey);
 
   const data = await apiRequest('mapGetData.php?getBuses=2', {
     s0: system.id,
@@ -112,10 +122,12 @@ export async function fetchVehicles(systemKey) {
 
   const vehicles = [];
   const buses = data.buses || {};
+  const allowed = system.onlyRoutes ? new Set(system.onlyRoutes) : null;
 
   for (const [deviceId, busList] of Object.entries(buses)) {
     if (Array.isArray(busList)) {
       for (const bus of busList) {
+        if (allowed && !allowed.has(String(bus.routeId))) continue;
         vehicles.push({
           id: `${systemKey}:${deviceId}`,
           busNumber: bus.bus || bus.busName || bus.busId,
@@ -146,6 +158,7 @@ export async function fetchVehicles(systemKey) {
 export async function fetchRouteData(systemKey) {
   const system = SYSTEMS[systemKey];
   if (!system) throw new Error(`Unknown system: ${systemKey}`);
+  if (system.type === 'mbta') return fetchRouteData_MBTA(systemKey);
 
   try {
     const data = await apiRequest('mapGetData.php?getStops=2', {
@@ -153,10 +166,13 @@ export async function fetchRouteData(systemKey) {
       sA: 1
     });
 
+    const allowed = system.onlyRoutes ? new Set(system.onlyRoutes) : null;
+
     // Extract route points (polylines), keyed by prefixed routeId
     const routePoints = {};
     if (data.routePoints) {
       for (const [rawRouteId, pointsArray] of Object.entries(data.routePoints)) {
+        if (allowed && !allowed.has(String(rawRouteId))) continue;
         if (Array.isArray(pointsArray) && pointsArray.length > 0) {
           const points = pointsArray[0];
           if (Array.isArray(points)) {
@@ -207,6 +223,7 @@ export async function fetchRouteData(systemKey) {
     const routeInfo = {};
     if (data.routes) {
       for (const [rawRouteId, routeData] of Object.entries(data.routes)) {
+        if (allowed && !allowed.has(String(rawRouteId))) continue;
         if (Array.isArray(routeData) && routeData.length >= 2) {
           const prefixedRouteId = prefixRouteId(systemKey, rawRouteId);
           routeInfo[prefixedRouteId] = {
@@ -250,6 +267,206 @@ export async function fetchRouteData(systemKey) {
   } catch (error) {
     console.warn(`Could not fetch route data for ${systemKey}:`, error);
     return { routePoints: {}, stops: {}, routeInfo: {} };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MBTA V3 API helpers
+// ---------------------------------------------------------------------------
+
+async function mbtaRequest(endpoint) {
+  const res = await fetch(`${MBTA_BASE}${endpoint}`);
+  if (!res.ok) throw new Error(`MBTA HTTP ${res.status}`);
+  return res.json();
+}
+
+/** Decode a Google-encoded polyline string into [[lat, lng], ...]. */
+function decodeGooglePolyline(str) {
+  const coords = [];
+  let index = 0, lat = 0, lng = 0;
+  while (index < str.length) {
+    let result = 0, shift = 0, b;
+    do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+    result = 0; shift = 0;
+    do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+    coords.push([lat / 1e5, lng / 1e5]);
+  }
+  return coords;
+}
+
+async function fetchRoutes_MBTA(systemKey) {
+  const system = SYSTEMS[systemKey];
+  const data = await mbtaRequest(`/routes/${system.mbtaRouteId}`);
+  const r = data.data;
+  return [{
+    myid: prefixRouteId(systemKey, r.id),
+    _rawMyid: String(r.id),
+    systemKey,
+    name: r.attributes.long_name || `Route ${r.attributes.short_name || r.id}`,
+    color: r.attributes.color ? `#${r.attributes.color}` : '#FFC72C',
+    active: true,
+  }];
+}
+
+async function fetchVehicles_MBTA(systemKey) {
+  const system = SYSTEMS[systemKey];
+  const dir = system.mbtaDirection ?? 0;
+  const data = await mbtaRequest(`/vehicles?filter[route]=${system.mbtaRouteId}&filter[direction_id]=${dir}`);
+  return (data.data || []).map(v => ({
+    id: `${systemKey}:${v.id}`,
+    busNumber: v.id,
+    routeId: prefixRouteId(systemKey, system.mbtaRouteId),
+    routeName: `Route ${system.mbtaRouteId}`,
+    routeColor: '#FFC72C',
+    systemKey,
+    latitude: parseFloat(v.attributes.latitude),
+    longitude: parseFloat(v.attributes.longitude),
+    heading: parseFloat(v.attributes.bearing || 0),
+    passengers: 0,
+    capacity: 0,
+    lastUpdate: v.attributes.updated_at,
+    outOfService: false,
+  }));
+}
+
+async function fetchRouteData_MBTA(systemKey) {
+  const system = SYSTEMS[systemKey];
+  const rid = system.mbtaRouteId;
+  const prefixed = prefixRouteId(systemKey, rid);
+
+  // direction_id=0 gives northbound (Nubian → Harvard) — one direction only
+  // so we get ~24 stops in service order instead of 46 from both directions.
+  const dir = system.mbtaDirection ?? 0;
+  const [stopsRes, shapesRes] = await Promise.all([
+    mbtaRequest(`/stops?filter[route]=${rid}&filter[direction_id]=${dir}&fields[stop]=name,latitude,longitude`),
+    mbtaRequest(`/shapes?filter[route]=${rid}`),
+  ]);
+
+  // Stops — group under the prefixed route ID (already in service order)
+  const stops = {};
+  const stopList = (stopsRes.data || []).map((s, idx) => ({
+    id: String(s.id),
+    name: s.attributes.name,
+    latitude: parseFloat(s.attributes.latitude),
+    longitude: parseFloat(s.attributes.longitude),
+    radius: 30,
+    routeId: prefixed,
+    routeName: `Route ${rid}`,
+    systemKey,
+    sequence: idx,
+  }));
+  stops[prefixed] = stopList;
+
+  // Route polyline — take the first (longest) shape
+  const routePoints = {};
+  const shapes = shapesRes.data || [];
+  if (shapes.length > 0) {
+    // Pick the shape with the most points (longest variant)
+    let bestShape = shapes[0];
+    let bestLen = 0;
+    for (const sh of shapes) {
+      const decoded = decodeGooglePolyline(sh.attributes.polyline || '');
+      if (decoded.length > bestLen) {
+        bestLen = decoded.length;
+        bestShape = sh;
+      }
+    }
+    routePoints[prefixed] = decodeGooglePolyline(bestShape.attributes.polyline || '');
+  }
+
+  const routeInfo = {
+    [prefixed]: { name: `Route ${rid}`, color: '#FFC72C', systemKey },
+  };
+
+  return { routePoints, stops, routeInfo };
+}
+
+async function fetchStopETAs_MBTA(rawRouteId, stopIdRaw) {
+  if (!rawRouteId || !stopIdRaw) return [];
+  try {
+    const data = await mbtaRequest(
+      `/predictions?filter[route]=${rawRouteId}&filter[stop]=${stopIdRaw}&sort=arrival_time`
+    );
+    const nowMs = Date.now();
+    return (data.data || [])
+      .filter(p => p.attributes.arrival_time)
+      .map(p => {
+        const arrMs = new Date(p.attributes.arrival_time).getTime();
+        const secs = Math.max(0, Math.round((arrMs - nowMs) / 1000));
+        const veh = p.relationships?.vehicle?.data;
+        return {
+          busName: veh ? String(veh.id) : '?',
+          deviceId: null,
+          busId: null,
+          secondsUntil: secs,
+          arrivalEpochMs: arrMs,
+          solid: true,
+          updatedSecAgo: null,
+          outOfService: false,
+          speed: null,
+          raw: p,
+        };
+      })
+      .filter(e => e.secondsUntil < 7200); // drop predictions >2h out
+  } catch (error) {
+    console.warn(`MBTA ETA fetch failed for route=${rawRouteId} stop=${stopIdRaw}:`, error);
+    return [];
+  }
+}
+
+/**
+ * MBTA route positions: use the vehicles endpoint to find which stop each
+ * bus is currently at or heading to, then map the stop ID to our stop-list
+ * index to produce `routeStopPosition`. This gives the pinned panel
+ * authoritative "stops away" data without GPS polyline projection.
+ */
+async function fetchRoutePositions_MBTA(systemKey, rawRouteId) {
+  const system = SYSTEMS[systemKey];
+  if (!system) return [];
+  const dir = system.mbtaDirection ?? 0;
+  try {
+    const data = await mbtaRequest(
+      `/vehicles?filter[route]=${rawRouteId}&filter[direction_id]=${dir}&include=stop`
+    );
+    // Build a stop-id → index lookup from our cached route data.
+    // We need the stop list for this route to resolve indices.
+    // The caller (refreshPinnedRoutePositionsForSlot) will use the
+    // routeStopPosition to compute fractional bus progress.
+    const included = data.included || [];
+    const out = [];
+    for (const v of data.data || []) {
+      const stopRel = v.relationships?.stop?.data;
+      if (!stopRel) continue;
+      const stopId = stopRel.id;
+      // current_stop_sequence from GTFS — 0-indexed position in this trip
+      const seq = v.attributes.current_stop_sequence;
+      // Map GTFS sequence (which may start at a non-zero value and may have
+      // gaps) to a 0-based ordinal.  The sequence values the MBTA returns
+      // start at 0 for the first stop and increment by 10 (or similar).
+      // We normalise by dividing/rounding to get an approximate index.
+      // A more robust approach: look up the stop ID in the stop list we
+      // already loaded (state.routeData.stops) — but that lives in main.js,
+      // not here. So we pass the raw sequence and let the consumer cope.
+      out.push({
+        busName: String(v.id),
+        routeStopPosition: seq != null ? seq : 0,
+        routePointPosition: null,
+        stopRoutePointPosition: null,
+        tripId: v.relationships?.trip?.data?.id || null,
+        routeBlockId: null,
+        dwell: null,
+        // Extra MBTA-specific: pass the actual stop ID so the consumer can
+        // resolve a reliable index from the stop list.
+        _mbtaStopId: stopId,
+        raw: v,
+      });
+    }
+    return out;
+  } catch (error) {
+    console.warn(`MBTA position fetch failed for route=${rawRouteId}:`, error);
+    return [];
   }
 }
 
@@ -346,8 +563,10 @@ export async function fetchAllRoutesAndData() {
  * Never throws — errors are logged and an empty array is returned, so a
  * failing ETA call cannot break the main render loop.
  */
-export async function fetchStopETAs(routeIdRaw, stopIdRaw) {
+export async function fetchStopETAs(systemKey, routeIdRaw, stopIdRaw) {
   if (!routeIdRaw || !stopIdRaw) return [];
+  const system = systemKey ? SYSTEMS[systemKey] : null;
+  if (system?.type === 'mbta') return fetchStopETAs_MBTA(routeIdRaw, stopIdRaw);
 
   const params = new URLSearchParams({
     eta: '3',
@@ -448,8 +667,10 @@ export async function fetchStopETAs(routeIdRaw, stopIdRaw) {
  * Never throws — errors are logged and an empty array is returned so a
  * failing position fetch can't break the rest of the render loop.
  */
-export async function fetchRoutePositions(routeIdRaw) {
+export async function fetchRoutePositions(systemKey, routeIdRaw) {
   if (!routeIdRaw) return [];
+  const system = systemKey ? SYSTEMS[systemKey] : null;
+  if (system?.type === 'mbta') return fetchRoutePositions_MBTA(systemKey, routeIdRaw);
 
   const params = new URLSearchParams({
     eta: '3',

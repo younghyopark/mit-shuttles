@@ -144,13 +144,18 @@ body {
   50% { opacity: 0.5; }
 }
 
+/* Container for up to 2 stacked pinned-stop panels */
+.pinned-panels {
+  flex-shrink: 0;
+  z-index: 900;
+}
+
 /* Pinned stop panel — a single stop with an approach-line visualization */
 .pinned-panel {
   background: var(--bg-card);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   padding: 0.55rem 0.85rem 0.5rem;
-  z-index: 900;
 }
 
 .pinned-panel.hidden {
@@ -425,11 +430,19 @@ body {
   opacity: 0.75;
 }
 
+/* Stale: underlying bus position is >90s old. The prediction might
+   still be OK, so we dim without striking through. */
 .track-bus-eta.stale {
-  opacity: 0.5;
-  text-decoration: line-through;
-  text-decoration-thickness: 1px;
-  text-decoration-color: rgba(255, 255, 255, 0.4);
+  opacity: 0.35;
+}
+
+/* Suspect: the ETA is physically implausible given how many stops
+   the bus still has to pass. Aggressively dimmed so it doesn't
+   mislead, but still visible for users who want to glance at the
+   raw number. The "~" prefix is injected in the HTML. */
+.track-bus-eta.suspect {
+  opacity: 0.25;
+  font-weight: 400;
 }
 
 .track-empty {
@@ -442,6 +455,15 @@ body {
   font-size: 0.78rem;
   font-style: italic;
   pointer-events: none;
+  z-index: 2;
+}
+
+/* Dim track elements when the empty-state message is showing so the
+   text is legible against the line + dots behind it. */
+.pinned-track:has(.track-empty) .track-line,
+.pinned-track:has(.track-empty) .track-prev-dot,
+.pinned-track:has(.track-empty) .track-stop {
+  opacity: 0.25;
 }
 
 .track-empty.hidden {
@@ -487,9 +509,12 @@ body {
 }
 
 .overflow-eta.stale {
-  opacity: 0.55;
-  text-decoration: line-through;
-  text-decoration-color: rgba(255, 255, 255, 0.4);
+  opacity: 0.35;
+}
+
+.overflow-eta.suspect {
+  opacity: 0.25;
+  font-weight: 400;
 }
 
 .pinned-overflow::-webkit-scrollbar {
