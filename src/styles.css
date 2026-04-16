@@ -579,9 +579,9 @@ body {
   bottom: calc(20px + var(--safe-area-bottom));
   right: 12px;
   z-index: 800;
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
   border: none;
   background: var(--bg-card);
   color: var(--text);
@@ -606,16 +606,13 @@ body {
    above it with a small gap so the two buttons read as a toolbar. */
 .theme-toggle {
   position: absolute;
-  bottom: calc(72px + var(--safe-area-bottom));
+  bottom: calc(66px + var(--safe-area-bottom));
   right: 12px;
   z-index: 800;
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
   border: none;
-  background: var(--bg-card);
-  color: var(--text);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -797,6 +794,73 @@ body {
   font-style: italic;
   text-align: center;
   padding: 1rem;
+}
+
+/* Leaflet zoom controls + all map buttons — themed to match the current
+   map tile style (light or dark). A `data-theme` attribute on <body> is
+   toggled by toggleMapTheme(); CSS uses it to flip between light and dark
+   button palettes. On mobile everything is slightly smaller and more
+   translucent so the buttons feel less heavy over the map. */
+.leaflet-control-zoom {
+  border: none !important;
+  border-radius: 10px !important;
+  overflow: hidden !important;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25) !important;
+}
+
+.leaflet-control-zoom a {
+  border: none !important;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.15) !important;
+  width: 36px !important;
+  height: 36px !important;
+  line-height: 36px !important;
+  font-size: 16px !important;
+  font-weight: 300 !important;
+  transition: background 0.12s !important;
+}
+
+.leaflet-control-zoom a:last-child {
+  border-bottom: none !important;
+}
+
+/* ---- Light map buttons (default) ---- */
+.leaflet-control-zoom a {
+  background: rgba(255, 255, 255, 0.85) !important;
+  color: #333 !important;
+}
+.leaflet-control-zoom a:hover {
+  background: rgba(255, 255, 255, 1) !important;
+}
+
+.route-fab,
+.theme-toggle {
+  background: rgba(255, 255, 255, 0.85);
+  color: #333;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25);
+}
+.route-fab:hover,
+.theme-toggle:hover {
+  background: rgba(255, 255, 255, 1);
+}
+
+/* ---- Dark map buttons ---- */
+body[data-theme="dark"] .leaflet-control-zoom a {
+  background: rgba(35, 35, 35, 0.85) !important;
+  color: #ddd !important;
+}
+body[data-theme="dark"] .leaflet-control-zoom a:hover {
+  background: rgba(50, 50, 50, 1) !important;
+}
+
+body[data-theme="dark"] .route-fab,
+body[data-theme="dark"] .theme-toggle {
+  background: rgba(35, 35, 35, 0.85);
+  color: #ddd;
+  box-shadow: 0 1px 8px rgba(0, 0, 0, 0.5);
+}
+body[data-theme="dark"] .route-fab:hover,
+body[data-theme="dark"] .theme-toggle:hover {
+  background: rgba(50, 50, 50, 1);
 }
 
 /* Bus markers */
@@ -1287,18 +1351,6 @@ body {
   }
 
   /* Adjust Leaflet controls for mobile */
-  .leaflet-control-zoom {
-    margin-left: 10px !important;
-    margin-top: 10px !important;
-  }
-
-  .leaflet-control-zoom a {
-    width: 36px !important;
-    height: 36px !important;
-    line-height: 36px !important;
-    font-size: 18px !important;
-  }
-
   /* Better popup on mobile */
   .leaflet-popup-content-wrapper {
     border-radius: 16px;

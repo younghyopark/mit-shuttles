@@ -102,7 +102,7 @@ function initMap() {
   state.map = L.map('map', {
     center: MIT_CENTER,
     zoom: DEFAULT_ZOOM,
-    zoomControl: true,
+    zoomControl: false,
     // zoomSnap controls how Leaflet rounds zoom levels. The default is
     // 1 (integer-only), which means fitBounds has to pick the NEAREST
     // integer zoom that fits the whole bounds — even if the actual
@@ -115,6 +115,12 @@ function initMap() {
     zoomSnap: 0.25,
     zoomDelta: 1,
   });
+
+  // Add zoom controls to bottom-left (default is top-left).
+  L.control.zoom({ position: 'bottomleft' }).addTo(state.map);
+
+  // Set the body data-theme so CSS can style map buttons to match tiles.
+  document.body.setAttribute('data-theme', state.mapTheme);
 
   // Add tile layer — respects the persisted theme preference.
   state.tileLayer = L.tileLayer(TILE_URLS[state.mapTheme] || TILE_URLS.dark, {
@@ -131,6 +137,7 @@ function initMap() {
 function toggleMapTheme() {
   const next = state.mapTheme === 'dark' ? 'light' : 'dark';
   state.mapTheme = next;
+  document.body.setAttribute('data-theme', next);
   try { localStorage.setItem(MAP_THEME_KEY, next); } catch (_) {}
 
   // Swap the tile layer in place. Leaflet handles the transition —
